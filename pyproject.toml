@@ -11,7 +11,6 @@ version = "0.0.0"
 description = "DIAL model adapters for OpenAI, Vertex AI, Bedrock and DIAL"
 authors = [{ name = "EPAM RAIL", email = "SpecialEPM-DIALDevTeam@epam.com" }]
 license = "Apache-2.0"
-readme = "README.md"
 keywords = ["ai"]
 classifiers = ["Topic :: Software Development :: Libraries :: Python Modules"]
 # The intersection of what the four adapters declare today (<3.13 from openai
