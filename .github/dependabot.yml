@@ -1,6 +1,5 @@
 version: 2
 updates:
-  # One lockfile for the whole image (docs/design.md §4).
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
@@ -10,8 +9,8 @@ updates:
     # Disable version updates, keep security updates only
     open-pull-requests-limit: 0
     commit-message:
+      # Prefix all commit messages with "chore: "
       prefix: "chore"
-
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -19,7 +18,8 @@ updates:
       day: "wednesday"
       time: "09:00"
     commit-message:
-      prefix: "chore"
+      prefix: "ci"
+      include: scope
     groups:
       ai-dial-ci:
         applies-to: version-updates
