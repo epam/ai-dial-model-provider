@@ -1,0 +1,141 @@
+from dataclasses import dataclass
+
+import httpx
+import pytest
+
+from aidial_model_provider.vertexai.deployments import (
+    ChatCompletionDeployment as D,
+)
+from tests.utils.vertexai.openai import sanitize_test_name
+from tests.utils.vertexai.validation import check_enum_completeness
+
+
+@dataclass
+class TestCase:
+    __test__ = False
+
+    deployment: D
+    tokenize_supported: bool
+    truncate_supported: bool
+    configuration_supported: bool
+
+    def get_id(self):
+        return sanitize_test_name(self.deployment.value)
+
+
+test_cases: list[TestCase] = [
+    TestCase(D.IMAGEN_005, True, True, True),
+    TestCase(D.IMAGEN_3_GENERATE_001, True, True, True),
+    TestCase(D.IMAGEN_3_GENERATE_002, True, True, True),
+    TestCase(D.IMAGEN_3_FAST_GENERATE, True, True, True),
+    TestCase(D.IMAGEN_4_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.IMAGEN_4_FAST_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.IMAGEN_4_ULTRA_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.IMAGEN_4_GENERATE, True, True, True),
+    TestCase(D.IMAGEN_4_FAST_GENERATE, True, True, True),
+    TestCase(D.IMAGEN_4_ULTRA_GENERATE, True, True, True),
+    TestCase(D.GEMINI_2_0_FLASH_EXP, True, True, True),
+    TestCase(D.GEMINI_2_0_FLASH_001, True, True, False),
+    TestCase(D.GEMINI_2_5_PRO, True, True, True),
+    TestCase(D.GEMINI_2_5_PRO_PREVIEW_03_25, True, True, True),
+    TestCase(D.GEMINI_3_PRO, True, True, True),
+    TestCase(D.GEMINI_3_PRO_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_3_FLASH_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_3_PRO_IMAGE_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_3_1_FLASH_IMAGE_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_3_1_FLASH_LITE_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_3_1_PRO_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_2_0_FLASH_LITE_1, True, True, False),
+    TestCase(D.GEMINI_2_5_FLASH, True, True, True),
+    TestCase(D.GEMINI_2_5_FLASH_IMAGE_PREVIEW, True, True, True),
+    TestCase(D.GEMINI_2_5_FLASH_IMAGE, True, True, True),
+    TestCase(D.GEMINI_3_1_FLASH_LITE, True, True, True),
+    TestCase(D.GEMINI_3_5_FLASH, True, True, True),
+    TestCase(D.GEMINI_3_5_TRANSCRIBE_PREVIEW, True, True, False),
+    TestCase(D.CLAUDE_3_5_SONNET_V2, True, True, True),
+    TestCase(D.CLAUDE_3_5_HAIKU, True, True, True),
+    TestCase(D.CLAUDE_3_OPUS, True, True, True),
+    TestCase(D.CLAUDE_3_5_SONNET, True, True, True),
+    TestCase(D.CLAUDE_3_HAIKU, True, True, True),
+    TestCase(D.CLAUDE_3_7_SONNET, True, True, True),
+    TestCase(D.CLAUDE_4_OPUS, True, True, True),
+    TestCase(D.CLAUDE_4_SONNET, True, True, True),
+    TestCase(D.CLAUDE_4_1_OPUS, True, True, True),
+    TestCase(D.CLAUDE_4_5_HAIKU, True, True, True),
+    TestCase(D.CLAUDE_4_5_SONNET, True, True, True),
+    TestCase(D.CLAUDE_4_6_SONNET, True, True, True),
+    TestCase(D.CLAUDE_4_6_OPUS, True, True, True),
+    TestCase(D.CLAUDE_4_5_OPUS, True, True, True),
+    TestCase(D.VEO_3_0_GENERATE, True, True, True),
+    TestCase(D.VEO_3_0_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.VEO_3_0_FAST_GENERATE, True, True, True),
+    TestCase(D.VEO_3_0_FAST_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.VEO_3_1_GENERATE, True, True, True),
+    TestCase(D.VEO_3_1_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.VEO_3_1_FAST_GENERATE, True, True, True),
+    TestCase(D.VEO_3_1_FAST_GENERATE_PREVIEW, True, True, True),
+    TestCase(D.MISTRAL_MEDIUM_3, False, False, False),
+    TestCase(D.MISTRAL_SMALL, False, False, False),
+    TestCase(D.MISTRAL_CODESTRAL_2, False, False, False),
+]
+
+check_enum_completeness([tc.deployment for tc in test_cases])
+
+
+async def assert_feature(
+    http_client: httpx.AsyncClient,
+    endpoint: str,
+    is_supported: bool,
+    headers: dict,
+    payload: dict | None,
+) -> None:
+    if payload is None:
+        response = await http_client.get(endpoint, headers=headers)
+    else:
+        response = await http_client.post(
+            endpoint, json=payload, headers=headers
+        )
+
+    if (response.status_code == 200 and not is_supported) or (
+        response.status_code == 404 and is_supported
+    ):
+        assert False, (
+            f"is_supported={is_supported}, code={response.status_code}, url={endpoint}"
+        )
+
+
+@pytest.mark.parametrize("test", test_cases, ids=lambda test: test.get_id())
+async def test_model_features(
+    test_http_client: httpx.AsyncClient, test: TestCase
+):
+    payload = {"inputs": []}
+    headers = {"Content-Type": "application/json", "Api-Key": "dummy"}
+
+    base = f"openai/deployments/{test.deployment.value}"
+
+    tokenize_endpoint = f"{base}/tokenize"
+    await assert_feature(
+        test_http_client,
+        tokenize_endpoint,
+        test.tokenize_supported,
+        headers,
+        payload,
+    )
+
+    truncate_endpoint = f"{base}/truncate_prompt"
+    await assert_feature(
+        test_http_client,
+        truncate_endpoint,
+        test.truncate_supported,
+        headers,
+        payload,
+    )
+
+    configuration_endpoint = f"{base}/configuration"
+    await assert_feature(
+        test_http_client,
+        configuration_endpoint,
+        test.configuration_supported,
+        headers,
+        None,
+    )

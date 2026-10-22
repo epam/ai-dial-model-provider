@@ -1,0 +1,26 @@
+import os
+
+from aidial_model_provider.vertexai.utils.env import get_env_int
+
+DEFAULT_REGION_ENV_VAR = "DEFAULT_REGION"
+DEFAULT_PROJECT_ENV_VAR = "GCP_PROJECT_ID"
+
+ANTHROPIC_MAX_RETRY_ATTEMPTS = get_env_int("ANTHROPIC_MAX_RETRY_ATTEMPTS", 0)
+GOOGLE_GENAI_MAX_RETRY_ATTEMPTS = get_env_int(
+    "GOOGLE_GENAI_MAX_RETRY_ATTEMPTS", 0
+)
+
+HTTP_MAX_CONNECTIONS = get_env_int("HTTP_MAX_CONNECTIONS", 250)
+HTTP_MAX_KEEPALIVE_CONNECTIONS = get_env_int(
+    "HTTP_MAX_KEEPALIVE_CONNECTIONS", 75
+)
+HTTP_POOL_TIMEOUT = get_env_int("HTTP_POOL_TIMEOUT", 10)
+HTTP_TRANSPORT = os.getenv("HTTP_TRANSPORT") or "aiohttp"
+if HTTP_TRANSPORT not in {"aiohttp", "httpx"}:
+    raise ValueError(
+        f"HTTP_TRANSPORT must be 'aiohttp' or 'httpx', got {HTTP_TRANSPORT!r}"
+    )
+
+HTTP_CONNECT_TIMEOUT = 5.0
+HTTP_READ_TIMEOUT = 10 * 60
+HTTP_WRITE_TIMEOUT = 10 * 60

@@ -1,0 +1,209 @@
+"""
+Types for Converse API:
+https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/bedrock-runtime/client/converse.html
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Literal, NotRequired, Required
+
+from typing_extensions import TypedDict
+
+from aidial_model_provider.bedrock.utils.json import remove_nones
+from aidial_model_provider.bedrock.utils.list_projection import ListProjection
+
+
+class ConverseRole(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class ConverseTextPart(TypedDict):
+    text: str
+
+
+class ConverseCachePoint(TypedDict, total=False):
+    type: Required[Literal["default"]]
+    ttl: Literal["5m", "1h"]
+
+
+class ConverseCachePointPart(TypedDict):
+    cachePoint: ConverseCachePoint
+
+
+class ConverseJsonPart(TypedDict):
+    json: dict
+
+
+class ConverseSource(TypedDict):
+    bytes: bytes
+
+
+class ConverseImagePartConfig(TypedDict):
+    format: Literal["png", "jpeg", "gif", "webp"] | str
+    source: ConverseSource
+
+
+class ConverseImagePart(TypedDict):
+    image: ConverseImagePartConfig
+
+
+class ConverseDocumentPartConfig(TypedDict):
+    format: (
+        Literal["pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"]
+        | str
+    )
+    name: str
+    source: ConverseSource
+
+
+class ConverseDocumentPart(TypedDict):
+    document: ConverseDocumentPartConfig
+
+
+class ConverseToolUseConfig(TypedDict):
+    toolUseId: str
+    name: str
+    #  > {...}|[...]|123|123.4|'string'|True|None
+    input: Any
+
+
+class ConverseToolUsePart(TypedDict):
+    toolUse: ConverseToolUseConfig
+
+
+class ConverseToolResultConfig(TypedDict):
+    toolUseId: str
+    content: list[ConverseTextPart | ConverseJsonPart]
+    status: str
+
+
+class ConverseToolResultPart(TypedDict):
+    toolResult: ConverseToolResultConfig
+
+
+ConverseContentPart = (
+    ConverseTextPart
+    | ConverseJsonPart
+    | ConverseImagePart
+    | ConverseDocumentPart
+    | ConverseToolUsePart
+    | ConverseToolResultPart
+    | ConverseCachePointPart
+)
+
+
+class ConverseToolConfig(TypedDict):
+    name: str
+    description: NotRequired[str]
+    inputSchema: dict
+
+
+class ConverseToolSpec(TypedDict):
+    toolSpec: ConverseToolConfig
+
+
+class ConverseTools(TypedDict):
+    tools: list[ConverseToolSpec | ConverseCachePointPart]
+    toolChoice: dict
+
+
+class ConverseToolUse(TypedDict):
+    toolUse: ConverseToolUseConfig
+
+
+class ConverseStopReason(str, Enum):
+    END_TURN = "end_turn"
+    TOOL_USE = "tool_use"
+    MAX_TOKENS = "max_tokens"
+    STOP_SEQUENCE = "stop_sequence"
+    GUARDRAIL_INTERVENED = "guardrail_intervened"
+    CONTENT_FILTERED = "content_filtered"
+
+
+class ConverseMessage(TypedDict):
+    role: ConverseRole
+    content: list[ConverseContentPart]
+
+
+class InferenceConfig(TypedDict, total=False):
+    temperature: float
+    topP: float
+    maxTokens: int
+    stopSequences: list[str]
+
+
+class PerformanceConfig(TypedDict, total=False):
+    latency: Literal["optimized", "standard"] | str
+
+
+class GuardrailConfig(TypedDict, total=False):
+    guardrailIdentifier: Required[str]
+    guardrailVersion: Required[str]
+    trace: Literal["enabled", "disabled", "enabled_full"] | str | None
+    streamProcessingMode: Literal["sync", "async"] | str | None
+
+
+class ConverseRequest(TypedDict, total=False):
+    messages: Required[list[ConverseMessage]]
+    system: list[ConverseTextPart | ConverseCachePointPart]
+    inferenceConfig: InferenceConfig
+    toolConfig: ConverseTools
+    performanceConfig: PerformanceConfig
+    guardrailConfig: GuardrailConfig
+
+
+@dataclass
+class ConverseRequestWrapper:
+    messages: ListProjection[ConverseMessage]
+    system: list[ConverseTextPart | ConverseCachePointPart] | None = None
+    inferenceConfig: InferenceConfig | None = None
+    toolConfig: ConverseTools | None = None
+    performanceConfig: PerformanceConfig | None = None
+    guardrailConfig: GuardrailConfig | None = None
+
+    def to_request(self) -> ConverseRequest:
+        return ConverseRequest(
+            messages=self.messages.raw_list,
+            **remove_nones(
+                {
+                    "inferenceConfig": self.inferenceConfig,
+                    "toolConfig": self.toolConfig,
+                    "system": self.system,
+                    "performanceConfig": self.performanceConfig,
+                    "guardrailConfig": self.guardrailConfig,
+                }
+            ),
+        )
+
+
+ConverseDeployment = str
+
+
+class ConverseImageType(str, Enum):
+    PNG = "png"
+    JPEG = "jpeg"
+    GIF = "gif"
+    WEBP = "webp"
+
+    @classmethod
+    def all(cls) -> list["ConverseImageType"]:
+        return list(cls)
+
+
+class ConverseDocumentType(str, Enum):
+    PDF = "pdf"
+    CSV = "csv"
+    DOC = "doc"
+    DOCX = "docx"
+    XLS = "xls"
+    XLSX = "xlsx"
+    TXT = "txt"
+    MD = "md"
+
+    @classmethod
+    def all(cls) -> list["ConverseDocumentType"]:
+        return list(cls)
+
+
+ConverseMessages = list[tuple[ConverseMessage, Any]]

@@ -1,0 +1,276 @@
+from unittest.mock import AsyncMock, call
+
+import pytest
+from aidial_sdk.exceptions import HTTPException as DialException
+from google.genai.types import Content, Part
+
+from aidial_model_provider.vertexai.chat.conversation.base import (
+    BaseConversation,
+)
+from aidial_model_provider.vertexai.chat.gemini.prompt.base import (
+    GeminiPromptGenAI,
+)
+from aidial_model_provider.vertexai.chat.gemini.prompt.gemini_2 import (
+    Gemini_2_Prompt,
+)
+from aidial_model_provider.vertexai.chat.gemini.prompt.message import (
+    GenAIMessageMerger,
+)
+from tests.unit_tests.vertexai.prompt_truncation.utils import (
+    get_discarded_messages,
+    get_discarded_messages_with_message_merge,
+)
+
+
+async def tokenize_by_words(prompt: GeminiPromptGenAI) -> int:
+    text = " ".join(
+        [
+            *[part.text or "" for part in prompt.conversation.system or []],
+            *[
+                part.text or ""
+                for content in prompt.conversation.messages.raw_list
+                for part in (content.parts or [])
+            ],
+        ]
+    )
+    return len(text.split())
+
+
+def text_parts(s: str) -> list[Part]:
+    return [Part.from_text(text=s)]
+
+
+def sys(s: str) -> list[Part]:
+    return text_parts(s)
+
+
+def user(s: str) -> Content:
+    return Content(role="user", parts=text_parts(s))
+
+
+def bot(s: str) -> Content:
+    return Content(role="model", parts=text_parts(s))
+
+
+@pytest.fixture
+def mock_tokenize():
+    mock = AsyncMock()
+    mock.side_effect = tokenize_by_words
+    return mock
+
+
+async def test_history_truncation_cut_nothing_1(mock_tokenize):
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(messages=[user("hello")])
+    )
+
+    discarded_messages = await get_discarded_messages(mock_tokenize, prompt, 1)
+
+    assert discarded_messages == []
+    assert mock_tokenize.call_args_list == [call(prompt)]
+
+
+def _indices(a: int, b: int) -> list[int]:
+    return list(range(a, b + 1))
+
+
+@pytest.mark.parametrize(
+    "max_prompt_tokens, with_system, expected_discarded",
+    [
+        (1, False, _indices(0, 7)),
+        (2, False, _indices(0, 7)),
+        (3, False, _indices(0, 5)),
+        (4, False, _indices(0, 5)),
+        (5, False, _indices(0, 5)),
+        (6, False, _indices(0, 5)),
+        (7, False, _indices(0, 5)),
+        (8, False, _indices(0, 5)),
+        (9, False, []),
+        (2, True, _indices(1, 8)),
+        (3, True, _indices(1, 8)),
+        (4, True, _indices(1, 6)),
+        (5, True, _indices(1, 6)),
+        (6, True, _indices(1, 6)),
+        (7, True, _indices(1, 6)),
+        (8, True, _indices(1, 6)),
+        (9, True, _indices(1, 6)),
+        (10, True, []),
+    ],
+)
+async def test_history_truncation_merge_messages(
+    mock_tokenize, with_system, max_prompt_tokens, expected_discarded
+):
+    contents: list[Content] = [
+        user("user1_1"),  # 0
+        user("user1_2"),  # 1
+        bot("bot1_1"),  # 2
+        bot("bot1_2"),  # 3
+        bot("bot1_3"),  # 4
+        bot("bot1_4"),  # 5
+        # first u+b turn = 6 tokens
+        user("user2"),  # 6
+        bot("bot2"),  # 7
+        # second u+b turn = 2 tokens
+        user("user3"),  # 8
+        # last user message = 1 token
+    ]
+
+    system = sys("system") if with_system else None
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=system, messages=contents)
+    )
+
+    discarded_messages = await get_discarded_messages_with_message_merge(
+        mock_tokenize, prompt, GenAIMessageMerger, max_prompt_tokens
+    )
+
+    assert discarded_messages == expected_discarded
+
+
+async def test_history_truncation_cut_nothing_2(mock_tokenize):
+    contents: list[Content] = [
+        user("message2"),
+        bot("message3"),
+        user("message4"),
+        bot("message5"),
+        user("message6"),
+    ]
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=None, messages=contents)
+    )
+
+    discarded_messages = await get_discarded_messages(mock_tokenize, prompt, 5)
+
+    assert discarded_messages == []
+    assert mock_tokenize.call_args_list == [call(prompt)]
+
+
+async def test_history_truncation_cut_nothing_3(mock_tokenize):
+    contents: list[Content] = [
+        user("message2"),
+        bot("message3"),
+        user("message4"),
+        bot("message5"),
+        user("message6"),
+    ]
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=None, messages=contents)
+    )
+
+    discarded_messages = await get_discarded_messages(
+        mock_tokenize, prompt, 1000
+    )
+
+    assert discarded_messages == []
+    assert mock_tokenize.call_args_list == [call(prompt)]
+
+
+async def test_history_truncation_cut_all_turns(mock_tokenize):
+    system = sys("message1")
+    contents: list[Content] = [
+        user("message2"),
+        bot("message3"),
+        user("message4"),
+        bot("message5"),
+        user("message6"),
+    ]
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=system, messages=contents)
+    )
+
+    discarded_messages = await get_discarded_messages(mock_tokenize, prompt, 2)
+    assert discarded_messages == [1, 2, 3, 4]
+    assert mock_tokenize.call_args_list == [
+        call(prompt),
+        call(prompt.omit({1, 2, 3, 4})),
+        call(prompt.omit({1, 2})),
+    ]
+
+
+async def test_history_truncation_cut_mid_turn(mock_tokenize):
+    system = sys("message1")
+    contents: list[Content] = [
+        user("message2"),
+        bot("message3"),
+        user("message4"),
+        bot("message5"),
+        user("message6"),
+    ]
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=system, messages=contents)
+    )
+
+    discarded_messages = await get_discarded_messages(mock_tokenize, prompt, 3)
+    assert discarded_messages == [1, 2, 3, 4]
+    assert mock_tokenize.call_args_list == [
+        call(prompt),
+        call(prompt.omit({1, 2, 3, 4})),
+        call(prompt.omit({1, 2})),
+    ]
+
+
+async def test_history_truncation_cut_last_turn(mock_tokenize):
+    system = sys("message1")
+    contents: list[Content] = [
+        user("message2"),
+        bot("message3"),
+        user("message4"),
+        bot("message5"),
+        user("message6"),
+    ]
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=system, messages=contents)
+    )
+
+    discarded_messages = await get_discarded_messages(mock_tokenize, prompt, 4)
+    assert discarded_messages == [1, 2]
+    assert mock_tokenize.call_args_list == [
+        call(prompt),
+        call(prompt.omit({1, 2, 3, 4})),
+        call(prompt.omit({1, 2})),
+    ]
+
+
+async def test_history_truncation_last_and_system_messages_are_too_big(
+    mock_tokenize,
+):
+    system = sys("message1 message1")
+    contents: list[Content] = [
+        user("message2"),
+        bot("message3"),
+        user("message4"),
+        bot("message5"),
+        user("message6"),
+    ]
+
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(system=system, messages=contents)
+    )
+
+    with pytest.raises(DialException) as exc_info:
+        await get_discarded_messages(mock_tokenize, prompt, 2)
+
+    assert (
+        exc_info.value.message
+        == "The requested maximum prompt tokens is 2. However, the system messages and the last user message resulted in 3 tokens. Please reduce the length of the messages or increase the maximum prompt tokens."
+    )
+
+
+async def test_history_truncation_last_message_is_too_big(mock_tokenize):
+    prompt = Gemini_2_Prompt(
+        conversation=BaseConversation.create(messages=[user("hello hello")])
+    )
+
+    with pytest.raises(DialException) as exc_info:
+        await get_discarded_messages(mock_tokenize, prompt, 1)
+
+    assert (
+        exc_info.value.message
+        == "The requested maximum prompt tokens is 1. However, the system messages and the last user message resulted in 2 tokens. Please reduce the length of the messages or increase the maximum prompt tokens."
+    )

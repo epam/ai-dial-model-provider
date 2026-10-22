@@ -1,0 +1,319 @@
+import asyncio
+import os
+import time
+from collections.abc import Mapping
+from typing import Any, assert_never
+
+from aidial_sdk.exceptions import HTTPException as DialException
+from aidial_sdk.exceptions import InternalServerError
+from azure.core.credentials import AccessToken
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity.aio import DefaultAzureCredential
+from pydantic import BaseModel
+from typing_extensions import TypedDict
+
+from aidial_model_provider.openai.configuration.app_config import (
+    DeploymentAPIEndpoint,
+    Vendor,
+)
+from aidial_model_provider.openai.utils.boto import close_client, create_client
+from aidial_model_provider.openai.utils.cache import cache
+from aidial_model_provider.openai.utils.concurrency import run_in_threadpool
+from aidial_model_provider.openai.utils.parsers import BedrockOpenAIEndpoint
+from aidial_model_provider.openai.utils.session_tags import (
+    SessionTag,
+    get_role_session_name,
+    resolve_session_tags,
+)
+from aidial_model_provider.openai.utils.upstream_headers import (
+    UpstreamExtraData,
+    get_upstream_extra_data,
+)
+from aidial_model_provider.utils.log_config import logger
+
+EXPIRATION_WINDOW_IN_SEC: int = int(
+    os.getenv("ACCESS_TOKEN_EXPIRATION_WINDOW", 10)
+)
+AZURE_OPEN_AI_SCOPE: str = os.getenv(
+    "AZURE_OPEN_AI_SCOPE", "https://cognitiveservices.azure.com/.default"
+)
+
+
+class _AzureTokenProvider:
+    _credential: DefaultAzureCredential
+    _access_token: AccessToken | None
+
+    def __init__(self) -> None:
+        self._credential = DefaultAzureCredential()
+        self._access_token = None
+
+    async def aclose(self):
+        await self._credential.close()
+
+    async def get_token(self) -> str:
+        now = int(time.time())
+
+        if (
+            self._access_token is None
+            or now + EXPIRATION_WINDOW_IN_SEC > self._access_token.expires_on
+        ):
+            try:
+                self._access_token = await self._credential.get_token(
+                    AZURE_OPEN_AI_SCOPE
+                )
+                logger.debug(
+                    f"Obtained new Azure access token, expires on {self._access_token.expires_on}"
+                )
+            except ClientAuthenticationError as e:
+                logger.error(
+                    f"Default Azure credential failed with the error: {e.message}"
+                )
+                raise DialException(
+                    "Authentication failed", 401, "Unauthorized"
+                )
+
+        return self._access_token.token
+
+
+async def _close_token_provider(provider: _AzureTokenProvider):
+    await provider.aclose()
+
+
+@cache(_close_token_provider)
+def get_azure_token_provider() -> _AzureTokenProvider:
+    return _AzureTokenProvider()
+
+
+class AWSCredentials(BaseModel):
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_session_token: str | None = None
+
+
+@cache(close_client)
+def get_sts_client(region: str) -> Any:
+    return create_client("sts", region_name=region)
+
+
+class _AWSAssumeRoleProvider:
+    """
+    Exchanges the ambient adapter credentials for temporary credentials of
+    the given role and reuses them until they are about to expire.
+    """
+
+    def __init__(
+        self,
+        role_arn: str,
+        region: str,
+        session_tags: list[SessionTag] | None,
+    ) -> None:
+        self._role_arn = role_arn
+        self._region = region
+        self._session_tags = session_tags
+        self._credentials: AWSCredentials | None = None
+        self._expires_on: int = 0
+        self._lock = asyncio.Lock()
+
+    def _assume_role(self) -> tuple[AWSCredentials, int]:
+        params: dict[str, Any] = {
+            "RoleArn": self._role_arn,
+            "RoleSessionName": get_role_session_name(self._session_tags),
+        }
+        if self._session_tags:
+            params["Tags"] = [
+                {"Key": tag["Key"], "Value": tag["Value"]}
+                for tag in self._session_tags
+            ]
+
+        creds = get_sts_client(self._region).assume_role(**params)[
+            "Credentials"
+        ]
+
+        return (
+            AWSCredentials(
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+            ),
+            int(creds["Expiration"].timestamp()),
+        )
+
+    async def get_credentials(self) -> AWSCredentials:
+        async with self._lock:
+            now = int(time.time())
+
+            if (
+                self._credentials is None
+                or now + EXPIRATION_WINDOW_IN_SEC > self._expires_on
+            ):
+                try:
+                    (
+                        self._credentials,
+                        self._expires_on,
+                    ) = await run_in_threadpool(self._assume_role)
+                except Exception as e:
+                    logger.error(f"Assuming role {self._role_arn} failed: {e}")
+                    raise InternalServerError(
+                        "Failed to assume the configured AWS role"
+                    ) from e
+
+                logger.debug(
+                    f"Assumed role {self._role_arn}, "
+                    f"credentials expire on {self._expires_on}"
+                )
+
+            return self._credentials
+
+
+CLIENT_CACHE_MAX_SIZE = 512
+
+
+@cache(maxsize=CLIENT_CACHE_MAX_SIZE)
+def get_assume_role_provider(
+    role_arn: str, region: str, session_tags: list[SessionTag] | None
+) -> _AWSAssumeRoleProvider:
+    return _AWSAssumeRoleProvider(role_arn, region, session_tags)
+
+
+class AWSClientCredentials(BaseModel):
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str | None = None
+
+    async def get_credentials(self, region: str) -> AWSCredentials:
+        return AWSCredentials(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+
+
+class AWSAssumeRoleCredentials(BaseModel):
+    aws_assume_role_arn: str
+
+    async def get_credentials(
+        self, region: str, session_tags: list[SessionTag] | None
+    ) -> AWSCredentials:
+        return await get_assume_role_provider(
+            self.aws_assume_role_arn, region, session_tags
+        ).get_credentials()
+
+
+def _select_credentials(
+    extra_data: UpstreamExtraData,
+) -> AWSClientCredentials | AWSAssumeRoleCredentials | None:
+    access_key_id = extra_data.aws_access_key_id or os.getenv(
+        "AWS_ACCESS_KEY_ID"
+    )
+    secret_access_key = extra_data.aws_secret_access_key or os.getenv(
+        "AWS_SECRET_ACCESS_KEY"
+    )
+    session_token = extra_data.aws_session_token or os.getenv(
+        "AWS_SESSION_TOKEN"
+    )
+    assume_role_arn = extra_data.aws_assume_role_arn or os.getenv(
+        "AWS_ASSUME_ROLE_ARN"
+    )
+
+    if access_key_id and secret_access_key:
+        return AWSClientCredentials(
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            aws_session_token=session_token,
+        )
+
+    if access_key_id or secret_access_key:
+        raise InternalServerError(
+            "Incomplete AWS credentials: aws_access_key_id and "
+            "aws_secret_access_key must be configured together."
+        )
+
+    if session_token:
+        raise InternalServerError(
+            "Incomplete AWS credentials: aws_session_token requires "
+            "aws_access_key_id and aws_secret_access_key."
+        )
+
+    if assume_role_arn:
+        return AWSAssumeRoleCredentials(aws_assume_role_arn=assume_role_arn)
+
+    return None
+
+
+class AWSCloudUpstreamConfig(BaseModel):
+    credentials: AWSClientCredentials | AWSAssumeRoleCredentials | None = None
+
+    @classmethod
+    def create(cls, headers: Mapping[str, str]) -> "AWSCloudUpstreamConfig":
+        extra_data = get_upstream_extra_data(headers)
+        return cls(credentials=_select_credentials(extra_data))
+
+    async def get_credentials(
+        self, aws_region: str, api_key: str | None, deployment_id: str | None
+    ) -> AWSCredentials:
+        match self.credentials:
+            case None:
+                return AWSCredentials()
+            case AWSClientCredentials():
+                return await self.credentials.get_credentials(aws_region)
+            case AWSAssumeRoleCredentials():
+                session_tags = await resolve_session_tags(
+                    api_key, deployment_id
+                )
+                return await self.credentials.get_credentials(
+                    aws_region, session_tags
+                )
+            case _:
+                assert_never(self.credentials)
+
+
+class OpenAICreds(TypedDict, total=False):
+    api_key: str
+    azure_ad_token: str
+
+    aws_access_key_id: str | None
+    aws_secret_access_key: str | None
+    aws_session_token: str | None
+
+
+async def get_credentials(
+    request_headers: Mapping[str, str],
+    *,
+    vendor: Vendor,
+    endpoint: DeploymentAPIEndpoint | None,
+    deployment_id: str | None,
+) -> OpenAICreds:
+    api_key = request_headers.get("X-UPSTREAM-KEY")
+    if api_key is not None:
+        return {"api_key": api_key}
+
+    match vendor:
+        case Vendor.AZURE:
+            return {
+                "azure_ad_token": await get_azure_token_provider().get_token()
+            }
+        case Vendor.AWS:
+            if not isinstance(endpoint, BedrockOpenAIEndpoint):
+                raise InternalServerError(
+                    "Unexpected endpoint for the AWS vendor: "
+                    f"{type(endpoint).__name__}"
+                )
+
+            upstream_config = AWSCloudUpstreamConfig.create(request_headers)
+            creds = await upstream_config.get_credentials(
+                endpoint.bedrock_region,
+                request_headers.get("api-key"),
+                deployment_id,
+            )
+
+            return {
+                "aws_access_key_id": creds.aws_access_key_id,
+                "aws_secret_access_key": creds.aws_secret_access_key,
+                "aws_session_token": creds.aws_session_token,
+            }
+        case Vendor.VLLM | Vendor.OPENAI_PLATFORM | Vendor.ALIBABA:
+            raise DialException(
+                "X-UPSTREAM-KEY header is missing", 401, "Unauthorized"
+            )
+        case _:
+            assert_never(vendor)

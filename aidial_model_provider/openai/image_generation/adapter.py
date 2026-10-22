@@ -1,0 +1,106 @@
+from typing import Any, TypeVar
+
+import fastapi
+from aidial_sdk.chat_completion import Request as DIALRequest
+from aidial_sdk.chat_completion import Response as DIALResponse
+from aidial_sdk.exceptions import InternalServerError
+from fastapi.responses import StreamingResponse
+from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai.types.images_response import ImagesResponse
+from pydantic import BaseModel
+
+from aidial_model_provider.openai.dial_api.attachment import (
+    create_dial_attachment,
+)
+from aidial_model_provider.openai.dial_api.request import parse_configuration
+from aidial_model_provider.openai.dial_api.sdk_adapter import sdk_adapter
+from aidial_model_provider.openai.dial_api.storage import FileStorage
+from aidial_model_provider.openai.image_generation.model import (
+    ImageGenerationModel,
+)
+from aidial_model_provider.openai.image_generation.prompt import ImageGenPrompt
+from aidial_model_provider.openai.utils.streaming import generate_id
+
+_Config = TypeVar("_Config", bound=BaseModel)
+
+
+async def chat_completion(
+    *,
+    request: fastapi.Request,
+    model: ImageGenerationModel[_Config],
+    deployment_id: str,
+    request_body: Any,
+    client: AsyncAzureOpenAI | AsyncOpenAI,
+    file_storage: FileStorage | None,
+) -> StreamingResponse | dict:
+    prompt = await ImageGenPrompt.from_request(request_body, file_storage)
+
+    n = int(request_body.get("n", 1))
+
+    config_cls = model.get_configuration()
+    response_format = model.get_response_format()
+    config = parse_configuration(config_cls, request_body) or config_cls()
+    extra_body = config.model_dump(exclude_none=True)
+
+    images = [
+        (f"image_{i}", resource.data, resource.type)
+        for (i, resource) in enumerate(prompt.images)
+    ]
+
+    if prompt.images:
+        model_response: ImagesResponse = await client.images.edit(
+            model=deployment_id,
+            image=images,  # type: ignore
+            prompt=prompt.text_prompt,
+            response_format=response_format,
+            n=n,
+            extra_body=extra_body,
+        )
+    else:
+        model_response = await client.images.generate(
+            model=deployment_id,
+            prompt=prompt.text_prompt,
+            response_format=response_format,
+            n=n,
+            extra_body=extra_body,
+        )
+
+    if not (images := model_response.data):
+        raise InternalServerError("The model didn't return an image")
+
+    image_content_type = model.get_image_content_type(config)
+
+    async def _handler(request: DIALRequest, response: DIALResponse) -> None:
+        response.set_model(deployment_id)
+        response.set_response_id(generate_id())
+        response.set_created(model_response.created)
+
+        for image in images:
+            with response.create_choice() as choice:
+                choice.append_content("")
+
+                if prompt := image.revised_prompt:
+                    choice.add_attachment(title="Revised prompt", data=prompt)
+
+                if (data_b64 := image.b64_json) is None:
+                    raise InternalServerError(
+                        "The model didn't return the base64 encoding of an image"
+                    )
+
+                choice.add_attachment(
+                    await create_dial_attachment(
+                        title="Image",
+                        content_type=image_content_type,
+                        data=data_b64,
+                        file_storage=file_storage,
+                        upload_dir="images",
+                    )
+                )
+
+        response.set_usage(prompt_tokens=0, completion_tokens=n)
+
+    return await sdk_adapter(
+        request=request,
+        deployment_id=deployment_id,
+        chat_completion=_handler,
+    )

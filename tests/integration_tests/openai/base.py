@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import functools
+import json
+from collections.abc import Callable, Generator
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    TypeVar,
+    assert_never,
+)
+
+from pydantic import BaseModel
+
+from aidial_model_provider.openai.configuration.app_config import (
+    ApplicationConfig,
+)
+from aidial_model_provider.openai.configuration.deployment_type import (
+    ChatCompletionDeploymentType,
+)
+from aidial_model_provider.openai.utils.pydantic import ExtraAllowedModel
+
+
+class UpstreamConfig(ExtraAllowedModel):
+    endpoint: str
+    key: str | None = None
+    extraData: Any | None = None
+
+
+class Features(ExtraAllowedModel):
+    """
+    What features/parameters the model supports.
+    * Function calling support: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/function-calling#function-calling-support
+    * Reasoning support: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/reasoning?tabs=python-secure%2Cpy#api--feature-support
+    """
+
+    systemPromptSupported: bool = True
+    toolsSupported: bool = True
+    parallelToolCallsSupported: bool = True
+    temperatureSupported: bool = True
+    autoCachingSupported: bool = False
+
+    # Not in the DIAL Core config yet
+    maxTokensSupported: bool = True
+    reasoningSupported: bool = False
+    reasoningSummarySupported: bool = False
+    stopSupported: bool = True
+    imageGenerationSupported: bool = False
+    imageEditingSupported: bool = False
+    emptyDialogSupported: bool = True
+    nSupported: bool = True
+
+    responseFormatJsonObjectSupported: bool = True
+    responseFormatJsonSchemaSupported: bool = True
+
+
+class Env(ExtraAllowedModel):
+    GPT_IMAGE_1_DEPLOYMENTS: bool = False
+    MISTRAL_DEPLOYMENTS: bool = False
+    AZURE_AI_VISION_DEPLOYMENTS: bool = False
+    VLLM_DEPLOYMENTS: bool = False
+
+    def save_to_application_config(
+        self, deployment_id: str, conf: ApplicationConfig
+    ):
+        if self.GPT_IMAGE_1_DEPLOYMENTS:
+            conf.GPT_IMAGE_1_DEPLOYMENTS.append(deployment_id)
+        if self.MISTRAL_DEPLOYMENTS:
+            conf.MISTRAL_DEPLOYMENTS.append(deployment_id)
+        if self.AZURE_AI_VISION_DEPLOYMENTS:
+            conf.AZURE_AI_VISION_DEPLOYMENTS.append(deployment_id)
+        if self.VLLM_DEPLOYMENTS:
+            conf.VLLM_DEPLOYMENTS.append(deployment_id)
+
+
+class ModelConfig(ExtraAllowedModel):
+    type: Literal["chat", "embedding"]
+    overrideName: str | None = None
+    defaults: dict | None = None
+    upstreams: list[UpstreamConfig]
+    features: Features = Features()
+    env: Env = Env()
+    inputAttachmentTypes: list[str] | None = None
+
+
+class CoreConfig(ExtraAllowedModel):
+    models: dict[str, ModelConfig]
+
+    @classmethod
+    def from_config(cls, config_path: str):
+        with open(config_path) as f:
+            test_config = json.load(f)
+
+        return cls(**test_config)
+
+    def get_app_config(self) -> ApplicationConfig:
+        ret = ApplicationConfig()
+        for model_id, model_config in self.models.items():
+            deployment_id = model_config.overrideName or model_id
+            model_config.env.save_to_application_config(deployment_id, ret)
+        return ret
+
+
+class EmbeddingsDeploymentType(BaseModel):
+    pass
+
+
+_T = TypeVar("_T")
+
+DeploymentType = ChatCompletionDeploymentType | EmbeddingsDeploymentType
+
+
+def _classify_deployment(
+    app_config: ApplicationConfig,
+    model_config: ModelConfig,
+    deployment_id: str,
+    upstream_endpoint: str,
+) -> DeploymentType:
+    if model_config.type == "chat":
+        return app_config.get_chat_completion_deployment_type(
+            deployment_id, upstream_endpoint
+        ).deployment_type
+    elif model_config.type == "embedding":
+        return EmbeddingsDeploymentType()
+    else:
+        assert_never(model_config.type)
+
+
+class DeploymentConfig(BaseModel, Generic[_T]):
+    id_: str
+    type_: _T
+
+    model_name: str
+    model_defaults: dict | None
+    model_features: Features
+    model_attachments: list[str]
+    override_name: str | None
+
+    upstream_endpoint: str
+    upstream_api_key: str | None
+    upstream_extra_data: Any | None
+    upstream_idx: int | None
+
+    @property
+    def upstream_headers(self) -> dict[str, str]:
+        headers = {"X-UPSTREAM-ENDPOINT": self.upstream_endpoint}
+        if self.upstream_api_key is not None:
+            headers["X-UPSTREAM-KEY"] = self.upstream_api_key
+        if self.override_name is not None:
+            headers["X-DIAL-OVERRIDE-NAME"] = self.override_name
+        if self.upstream_extra_data is not None:
+            headers["X-UPSTREAM-EXTRA-DATA"] = json.dumps(
+                self.upstream_extra_data
+            )
+        return headers
+
+    @classmethod
+    def create_deployments(
+        cls,
+        core_config: CoreConfig,
+        get_deployment_type: Callable[[ModelConfig, str, str], _T],
+    ) -> list[DeploymentConfig[_T]]:
+        configs = []
+        for deployment_id, model_config in core_config.models.items():
+            for upstream_index, upstream_config in enumerate(
+                model_config.upstreams
+            ):
+                upstream_endpoint = upstream_config.endpoint
+
+                upstream_idx = (
+                    None if len(model_config.upstreams) <= 1 else upstream_index
+                )
+
+                model_name = model_config.overrideName or deployment_id
+                configs.append(
+                    cls(
+                        upstream_idx=upstream_idx,
+                        id_=deployment_id,
+                        model_name=model_name,
+                        model_defaults=model_config.defaults,
+                        model_features=model_config.features,
+                        model_attachments=model_config.inputAttachmentTypes
+                        or [],
+                        override_name=model_config.overrideName,
+                        upstream_extra_data=upstream_config.extraData,
+                        type_=get_deployment_type(
+                            model_config, model_name, upstream_endpoint
+                        ),
+                        upstream_endpoint=upstream_endpoint,
+                        upstream_api_key=upstream_config.key,
+                    )
+                )
+        return configs
+
+    def display_config(self) -> str:
+        id_ = sanitize_id_part(self.id_)
+        if self.upstream_idx is None:
+            return id_
+        else:
+            return f"{id_}/upstream:{self.upstream_idx}"
+
+    @property
+    def supports_vision(self):
+        types = self.model_attachments
+        return any(ty.startswith("image/") or ty == "*/*" for ty in types)
+
+    @property
+    def supports_pdf(self):
+        types = self.model_attachments
+        return "application/pdf" in types or "*/*" in types
+
+    @property
+    def supports_video_generation(self):
+        return bool(
+            isinstance(self.type_, ChatCompletionDeploymentType)
+            and self.type_
+            in (
+                ChatCompletionDeploymentType.AZURE_VIDEO_API,
+                ChatCompletionDeploymentType.OPENAI_VIDEO_API,
+            )
+        )
+
+    @property
+    def supports_tts(self):
+        return self.type_ == ChatCompletionDeploymentType.AUDIO_SPEECH_API
+
+    @property
+    def supports_stt(self):
+        return (
+            self.type_ == ChatCompletionDeploymentType.AUDIO_TRANSCRIPTIONS_API
+        )
+
+    @property
+    def supports_reasoning(self):
+        return self.model_features.reasoningSupported
+
+    @property
+    def supports_auto_caching(self):
+        return self.model_features.autoCachingSupported
+
+
+class TestDeployments(BaseModel):
+    __test__ = False
+
+    deployments: list[DeploymentConfig[DeploymentType]]
+    app_config: ApplicationConfig
+
+    @classmethod
+    def from_config(cls, config_path: str):
+        core_config = CoreConfig.from_config(config_path)
+        app_config = core_config.get_app_config()
+
+        return cls(
+            app_config=app_config,
+            deployments=DeploymentConfig.create_deployments(
+                core_config,
+                functools.partial(_classify_deployment, app_config),
+            ),
+        )
+
+    @property
+    def chat_deployments(
+        self,
+    ) -> Generator[DeploymentConfig[ChatCompletionDeploymentType], None, None]:
+        for deployment in self.deployments:
+            if isinstance(deployment.type_, ChatCompletionDeploymentType):
+                yield deployment  # type: ignore
+
+    @property
+    def embedding_deployments(
+        self,
+    ) -> Generator[DeploymentConfig[EmbeddingsDeploymentType], None, None]:
+        for deployment in self.deployments:
+            if isinstance(deployment.type_, EmbeddingsDeploymentType):
+                yield deployment  # type: ignore
+
+
+def sanitize_id_part(value: Any) -> str:
+    """Convert any value to a pytest-safe identifier part."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, int | float):
+        return str(value).replace(".", "p")  # e.g., 0.5 -> 0p5
+    if value is None:
+        return "none"
+
+    value_str = str(value)
+    sanitized = "".join(c if c.isalnum() else "_" for c in value_str)
+    return sanitized.strip("_")

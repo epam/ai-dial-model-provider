@@ -1,0 +1,299 @@
+import json
+from abc import ABC
+from collections.abc import Mapping
+from datetime import datetime
+from functools import cache as functools_cache
+from logging import DEBUG
+from typing import Any, TypedDict, Unpack, assert_never
+
+import httpx
+from aidial_adapter_anthropic.dial.token_usage import TokenUsage
+from aidial_client import AsyncDialClientPool
+from anthropic import (
+    AsyncAnthropic,
+    AsyncAnthropicBedrock,
+    AsyncAnthropicBedrockMantle,
+)
+from botocore.response import StreamingBody
+from pydantic import BaseModel, Field
+
+from aidial_model_provider.bedrock.llm.converse.types import ConverseRequest
+from aidial_model_provider.bedrock.upstream_config import (
+    ApiKeyUpstreamConfig,
+    CloudUpstreamConfig,
+    SessionTag,
+    UpstreamConfig,
+)
+from aidial_model_provider.bedrock.utils.boto import close_client, create_client
+from aidial_model_provider.bedrock.utils.cache import cache, ttl_cache
+from aidial_model_provider.bedrock.utils.concurrency import (
+    run_in_threadpool,
+    to_async_iterator,
+)
+from aidial_model_provider.bedrock.utils.constants import (
+    ANTHROPIC_MAX_CONNECTIONS,
+    ANTHROPIC_MAX_KEEPALIVE_CONNECTIONS,
+    ANTHROPIC_MAX_RETRY_ATTEMPTS,
+    ANTHROPIC_POOL_TIMEOUT,
+    CLIENT_CACHE_MAX_SIZE,
+    DEFAULT_TIMEOUTS,
+    GENERATION_CONFIG,
+)
+from aidial_model_provider.bedrock.utils.json import json_dumps_short
+from aidial_model_provider.utils.log_config import logger as log
+
+Body = dict
+Headers = Mapping[str, str]
+
+
+class _BedrockClientParams(TypedDict):
+    aws_region: str
+    aws_access_key: str | None
+    aws_secret_key: str | None
+    aws_session_token: str | None
+    http_client: httpx.AsyncClient
+    max_retries: int
+
+
+@functools_cache
+def get_default_anthropic_timeout() -> httpx.Timeout:
+    # Providing a timeout marginally different from the default Anthropic timeout
+    # in order to disable the check that throws an error when
+    # stream=False & max_tokens>=128K/6:
+    # https://github.com/anthropics/anthropic-sdk-python/blob/f5bdf5137cc3da4d3663aedb8c63d54652981c3b/src/anthropic/resources/beta/messages/messages.py#L2175-L2176
+
+    timeout = DEFAULT_TIMEOUTS.as_dict()
+    timeout["connect"] *= 1.0001  # type: ignore
+    # Fail fast when the connection pool is exhausted instead of queueing
+    # for the whole request timeout.
+    timeout["pool"] = ANTHROPIC_POOL_TIMEOUT
+    return httpx.Timeout(**timeout)
+
+
+AnthropicClient = (
+    AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | AsyncAnthropic
+)
+
+
+async def _close_http_client(client: httpx.AsyncClient) -> None:
+    await client.aclose()
+
+
+@cache(close=_close_http_client)
+def get_anthropic_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=get_default_anthropic_timeout(),
+        follow_redirects=True,
+        limits=httpx.Limits(
+            # Max number of concurrent requests to the same upstream.
+            # It limits number of concurrent requests.
+            # `max_connections+1`-th request will be *blocked* until some other request has finished.
+            max_connections=ANTHROPIC_MAX_CONNECTIONS,
+            # Max number of idle connection to keep in a connection pool.
+            max_keepalive_connections=ANTHROPIC_MAX_KEEPALIVE_CONNECTIONS,
+        ),
+    )
+
+
+@ttl_cache(maxsize=CLIENT_CACHE_MAX_SIZE)
+async def create_anthropic_client(
+    upstream_config: UpstreamConfig,
+    session_tags: list[SessionTag] | None = None,
+) -> tuple[datetime | None, AnthropicClient]:
+    http_client = get_anthropic_http_client()
+
+    if isinstance(upstream_config, ApiKeyUpstreamConfig):
+        anthropic_client = AsyncAnthropic(
+            api_key=upstream_config.api_key,
+            http_client=http_client,
+            max_retries=ANTHROPIC_MAX_RETRY_ATTEMPTS,
+        )
+        return (None, anthropic_client)
+
+    expiration, creds = await upstream_config.get_credentials(session_tags)
+    client_params: _BedrockClientParams = {
+        "aws_region": upstream_config.region,
+        "aws_access_key": creds.aws_access_key_id,
+        "aws_secret_key": creds.aws_secret_access_key,
+        "aws_session_token": creds.aws_session_token,
+        "http_client": http_client,
+        "max_retries": ANTHROPIC_MAX_RETRY_ATTEMPTS,
+    }
+
+    match upstream_config.claude_client:
+        case "mantle":
+            return expiration, AsyncAnthropicBedrockMantle(**client_params)
+        case "legacy":
+            return expiration, AsyncAnthropicBedrock(**client_params)
+        case "converse":
+            raise ValueError(
+                "Claude client `converse` isn't supported for Anthropic API requests"
+            )
+        case _:
+            assert_never(upstream_config.claude_client)
+
+
+@ttl_cache(maxsize=CLIENT_CACHE_MAX_SIZE, close=close_client)
+async def create_boto_client(
+    service_name: str,
+    upstream_config: CloudUpstreamConfig,
+    session_tags: list[SessionTag] | None = None,
+) -> tuple[datetime | None, Any]:
+    expiration, creds = await upstream_config.get_credentials(session_tags)
+
+    client = await run_in_threadpool(
+        lambda: create_client(
+            service_name,
+            region_name=upstream_config.region,
+            aws_access_key_id=creds.aws_access_key_id,
+            aws_secret_access_key=creds.aws_secret_access_key,
+            aws_session_token=creds.aws_session_token,
+            config=GENERATION_CONFIG,
+        )
+    )
+    return (expiration, client)
+
+
+async def _close_dial_client_pool(pool: AsyncDialClientPool) -> None:
+    await pool.aclose()
+
+
+@cache(close=_close_dial_client_pool)
+def get_dial_client_pool() -> AsyncDialClientPool:
+    return AsyncDialClientPool()
+
+
+class Bedrock:
+    client: Any
+
+    def __init__(self, client: Any):
+        self.client = client
+
+    @classmethod
+    async def acreate(
+        cls,
+        upstream_config: UpstreamConfig,
+        session_tags: list[SessionTag] | None = None,
+    ) -> "Bedrock":
+        if isinstance(upstream_config, ApiKeyUpstreamConfig):
+            raise ValueError(
+                "Authentication via API key isn't supported for the deployment"
+            )
+
+        client = await create_boto_client(
+            "bedrock-runtime", upstream_config, session_tags
+        )
+        return cls(client)
+
+    async def aconverse_non_streaming(
+        self, model: str, **params: Unpack[ConverseRequest]
+    ):
+        response = await run_in_threadpool(
+            lambda: self.client.converse(modelId=model, **params)
+        )
+        return response
+
+    async def aconverse_streaming(
+        self, model: str, **params: Unpack[ConverseRequest]
+    ):
+        response = await run_in_threadpool(
+            lambda: self.client.converse_stream(modelId=model, **params)
+        )
+
+        return to_async_iterator(iter(response["stream"]))
+
+    async def acount_tokens(
+        self, model: str, **params: Unpack[ConverseRequest]
+    ) -> int:
+        response = await run_in_threadpool(
+            lambda: self.client.count_tokens(
+                modelId=model, input={"converse": params}
+            )
+        )
+        return response["inputTokens"]
+
+    def _create_invoke_params(self, model: str, body: dict) -> dict:
+        return {
+            "modelId": model,
+            "body": json.dumps(body),
+            "accept": "application/json",
+            "contentType": "application/json",
+        }
+
+    async def ainvoke_non_streaming(
+        self, model: str, args: dict
+    ) -> tuple[Body, Headers]:
+        if log.isEnabledFor(DEBUG):
+            log.debug(
+                f"request: {json_dumps_short({'model': model, 'args': args})}"
+            )
+
+        params = self._create_invoke_params(model, args)
+        response = await run_in_threadpool(
+            lambda: self.client.invoke_model(**params)
+        )
+
+        if log.isEnabledFor(DEBUG):
+            log.debug(f"response: {json_dumps_short(response)}")
+
+        body: StreamingBody = response["body"]
+        body_dict = json.loads(await run_in_threadpool(lambda: body.read()))
+
+        response_headers = response.get("ResponseMetadata", {}).get(
+            "HTTPHeaders", {}
+        )
+
+        if log.isEnabledFor(DEBUG):
+            log.debug(f"response['body']: {json_dumps_short(body_dict)}")
+
+        return body_dict, response_headers
+
+
+class InvocationMetrics(BaseModel):
+    inputTokenCount: int
+    outputTokenCount: int
+    invocationLatency: int
+    firstByteLatency: int
+
+
+class ResponseWithInvocationMetricsMixin(ABC, BaseModel):
+    invocation_metrics: InvocationMetrics | None = Field(
+        alias="amazon-bedrock-invocationMetrics"
+    )
+
+    def usage_from_metrics(self) -> TokenUsage:
+        metrics = self.invocation_metrics
+        if metrics is None:
+            return TokenUsage()
+
+        return TokenUsage(
+            prompt_tokens=metrics.inputTokenCount,
+            completion_tokens=metrics.outputTokenCount,
+        )
+
+
+def prompt_tokens_from_headers(headers: Headers) -> int | None:
+    try:
+        return int(headers["x-amzn-bedrock-input-token-count"])
+    except Exception:
+        log.error(
+            "Failed to extract prompt token usage from the response headers"
+        )
+        return None
+
+
+def completion_tokens_from_headers(headers: Headers) -> int | None:
+    try:
+        return int(headers["x-amzn-bedrock-output-token-count"])
+    except Exception:
+        log.error(
+            "Failed to extract completion token usage from the response headers"
+        )
+        return None
+
+
+def usage_from_headers(response_headers: Headers) -> TokenUsage:
+    return TokenUsage(
+        prompt_tokens=prompt_tokens_from_headers(response_headers) or 0,
+        completion_tokens=completion_tokens_from_headers(response_headers) or 0,
+    )

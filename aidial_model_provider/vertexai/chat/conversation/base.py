@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Generic, Self, TypeVar
+
+from aidial_model_provider.vertexai.utils.list import (
+    MessageMergeStrategy,
+    group_by,
+)
+from aidial_model_provider.vertexai.utils.list_projection import ListProjection
+
+SystemT = TypeVar("SystemT")
+MessageT = TypeVar("MessageT")
+
+
+# NOTE: it's not pydantic BaseModel, because
+# Claude's MessageParam.content is of Iterable type and
+# pydantic automatically converts lists into
+# list iterators following the type.
+# See https://github.com/anthropics/anthropic-sdk-python/issues/656 for details.
+@dataclass
+class BaseConversation(Generic[SystemT, MessageT]):
+    system: SystemT | None
+    messages: ListProjection[MessageT]
+
+    @classmethod
+    def create(
+        cls, *, system: SystemT | None = None, messages: list[MessageT]
+    ) -> Self:
+        return cls(
+            system=system,
+            messages=ListProjection.create(
+                messages, idx_offset=int(system is not None)
+            ),
+        )
+
+    def merge_messages_with_same_role(
+        self, merger: type[MessageMergeStrategy[MessageT]]
+    ) -> Self:
+        def _key(a: tuple[MessageT, set[int]]) -> str:
+            return merger.role(a[0])
+
+        def _merge(
+            a: tuple[MessageT, set[int]],
+            b: tuple[MessageT, set[int]],
+        ) -> tuple[MessageT, set[int]]:
+            (msg1, set1), (msg2, set2) = a, b
+            return (merger.merge(msg1, msg2), set1 | set2)
+
+        self.messages = ListProjection(
+            self.messages.start_index,
+            self.messages.end_index,
+            group_by(
+                lst=self.messages.lst,
+                key=_key,
+                init=lambda x: x,
+                merge=_merge,
+            ),
+        )
+
+        return self

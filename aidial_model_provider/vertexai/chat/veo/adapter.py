@@ -1,0 +1,241 @@
+import asyncio
+from logging import DEBUG
+
+from aidial_sdk.chat_completion import (
+    Attachment,
+    Status,
+)
+from aidial_sdk.chat_completion.request import ChatCompletionRequest
+from aidial_sdk.exceptions import InternalServerError, InvalidRequestError
+from google.genai.client import Client as GenAIClient
+from google.genai.types import (
+    GenerateVideosConfigDict,
+    GenerateVideosOperation,
+    GenerateVideosSource,
+)
+from pydantic import BaseModel
+from typing_extensions import override
+
+from aidial_model_provider.utils.log_config import logger as log
+from aidial_model_provider.vertexai.chat.chat_completion_adapter import (
+    ChatCompletionAdapter,
+)
+from aidial_model_provider.vertexai.chat.consumer import Consumer
+from aidial_model_provider.vertexai.chat.static_tools import StaticToolsConfig
+from aidial_model_provider.vertexai.chat.tools import ToolsConfig
+from aidial_model_provider.vertexai.chat.truncate_prompt import TruncatedPrompt
+from aidial_model_provider.vertexai.chat.veo.configuration import VeoConfig
+from aidial_model_provider.vertexai.chat.veo.prompt import (
+    VeoPrompt,
+    VeoPromptParser,
+)
+from aidial_model_provider.vertexai.deployments import VeoDeployment
+from aidial_model_provider.vertexai.dial_api.request import ModelParameters
+from aidial_model_provider.vertexai.dial_api.storage import (
+    FileStorage,
+    compute_hash_digest,
+)
+from aidial_model_provider.vertexai.dial_api.token_usage import TokenUsage
+from aidial_model_provider.vertexai.upstream_config import UpstreamConfig
+from aidial_model_provider.vertexai.utils.adapter_deployments import (
+    AdapterDeployment,
+)
+from aidial_model_provider.vertexai.utils.json import json_dumps_short
+from aidial_model_provider.vertexai.utils.resource import Resource
+from aidial_model_provider.vertexai.utils.timer import Timer
+
+_GRPC_INVALID_ARGUMENT_CODE = 3
+
+
+class VeoChatCompletionAdapter(ChatCompletionAdapter[VeoPrompt]):
+    file_storage: FileStorage | None
+    client: GenAIClient
+    deployment: AdapterDeployment[VeoDeployment]
+
+    def __init__(
+        self,
+        file_storage: FileStorage | None,
+        client: GenAIClient,
+        deployment: AdapterDeployment[VeoDeployment],
+    ):
+        self.file_storage = file_storage
+        self.client = client
+        self.deployment = deployment
+
+    @property
+    def model_id(self) -> str:
+        return self.deployment.upstream_deployment_id
+
+    async def configuration(self) -> type[VeoConfig]:
+        return VeoConfig
+
+    @override
+    async def parse_prompt(
+        self,
+        params: ModelParameters,
+        tools: ToolsConfig,
+        static_tools: StaticToolsConfig,
+        request: ChatCompletionRequest,
+    ) -> VeoPrompt:
+        tools.not_supported()
+        static_tools.not_supported()
+        return await VeoPromptParser.parse(self.file_storage, request.messages)
+
+    @override
+    async def truncate_prompt(
+        self, prompt: VeoPrompt, max_prompt_tokens: int
+    ) -> TruncatedPrompt[VeoPrompt]:
+        return TruncatedPrompt(discarded_messages=[], prompt=prompt)
+
+    @override
+    async def chat(
+        self, params: ModelParameters, consumer: Consumer, prompt: VeoPrompt
+    ) -> None:
+        configuration = params.parse_configuration(await self.configuration())
+        config = _prepare_generation_config(params, configuration)
+
+        if log.isEnabledFor(DEBUG):
+            msg = json_dumps_short(
+                {
+                    "model": self.model_id,
+                    "prompt": prompt.text,
+                    "has_image": prompt.image is not None,
+                    "has_video": prompt.video is not None,
+                    "config": config,
+                }
+            )
+            log.debug(f"request: {msg}")
+
+        with Timer("predict timing: {time}", log.debug):
+            source = GenerateVideosSource(
+                prompt=prompt.text or None,
+                image=prompt.image,
+                video=prompt.video,
+            )
+            operation = await self.client.aio.models.generate_videos(
+                model=self.model_id, source=source, config=config
+            )
+
+            stage = consumer.choice.create_stage(name="Generation")
+            stage.open()
+
+            poll_interval = 3
+            while not operation.done:
+                stage.append_content(".")
+                log.debug(f"Sleeping {poll_interval} seconds")
+                await asyncio.sleep(poll_interval)
+                operation = await self.client.aio.operations.get(operation)
+            response = operation.response
+
+        if log.isEnabledFor(DEBUG):
+            log.debug(f"response: {json_dumps_short(response)}")
+
+        if operation.error:
+            stage.close(status=Status.FAILED)
+            msg = operation.error.get("message")
+            if operation.error.get("code") == _GRPC_INVALID_ARGUMENT_CODE:
+                raise InvalidRequestError(msg or "Invalid argument")
+            else:
+                raise InternalServerError(msg or "Internal server error")
+        else:
+            stage.close(status=Status.COMPLETED)
+
+        if (generated_video := _extract_video(operation)) is None:
+            raise RuntimeError("Expected video in response, but got none")
+
+        resource = generated_video.resource
+        attachment = Attachment(
+            title="Video",
+            type=resource.type,
+            data=resource.data_base64,
+        )
+        if self.file_storage is not None:
+            with Timer("upload to file storage: {time}", log.debug):
+                filename = "videos/" + compute_hash_digest(resource.data)
+                meta = await self.file_storage.upload(
+                    filename=filename,
+                    content_type=resource.type,
+                    content=resource.data,
+                )
+
+            attachment.data = None
+            attachment.url = meta["url"]
+
+        await consumer.add_attachment(attachment)
+
+        # Avoid generating empty content
+        completion = " "
+        await consumer.append_content(completion)
+
+        completion_tokens = configuration.duration_seconds or 8
+        await consumer.set_usage(
+            TokenUsage(
+                prompt_tokens=await self.count_prompt_tokens(prompt),
+                completion_tokens=completion_tokens,
+            )
+        )
+
+    @override
+    async def count_prompt_tokens(self, prompt: VeoPrompt) -> int:
+        return 0
+
+    @override
+    async def count_completion_tokens(self, string: str) -> int:
+        return 1
+
+    @classmethod
+    async def create(
+        cls,
+        file_storage: FileStorage | None,
+        deployment: AdapterDeployment[VeoDeployment],
+        config: UpstreamConfig,
+    ) -> "VeoChatCompletionAdapter":
+        client = await config.get_genai_client()
+        return cls(file_storage, client, deployment)
+
+
+def _prepare_generation_config(
+    params: ModelParameters, config: VeoConfig | None
+) -> GenerateVideosConfigDict:
+    return (config or VeoConfig()).to_config_dict(params.seed)
+
+
+class GeneratedVideo(BaseModel):
+    resource: Resource
+
+
+def _extract_video(response: GenerateVideosOperation) -> GeneratedVideo | None:
+    result = response.response
+    if result is None:
+        return None
+
+    videos = result.generated_videos
+    if videos is None or len(videos) == 0:
+        return None
+
+    if len(videos) > 1:
+        log.warning(
+            f"Expected to receive 1 generated video, but got {len(videos)}. Only the first is taken into account."
+        )
+
+    if result.rai_media_filtered_count:
+        log.warning("The video was filtered due to RAI policies.")
+
+    if result.rai_media_filtered_reasons:
+        raise InvalidRequestError(
+            code="content_filter",
+            message=", ".join(result.rai_media_filtered_reasons),
+        )
+
+    generated_video = videos[0]
+
+    if (video := generated_video.video) is None:
+        return None
+
+    if (video_data := video.video_bytes) is None:
+        return None
+
+    video_type = video.mime_type or "video/mp4"
+    resource = Resource(type=video_type, data=video_data)
+
+    return GeneratedVideo(resource=resource)

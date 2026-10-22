@@ -1,0 +1,181 @@
+# One image, one process, one dependency set (docs/design.md §4). The four
+# adapters are packages in this project, not separate projects: they are resolved
+# and locked together because they are installed into the same interpreter.
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "aidial-model-adapter"
+version = "0.0.0"
+description = "DIAL model adapters for OpenAI, Vertex AI, Bedrock and DIAL"
+authors = [{ name = "EPAM RAIL", email = "SpecialEPM-DIALDevTeam@epam.com" }]
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["ai"]
+classifiers = ["Topic :: Software Development :: Libraries :: Python Modules"]
+# The intersection of what the four adapters declare today (<3.13 from openai
+# and dial, <3.14 from bedrock, <4 from vertexai).
+requires-python = ">=3.11,<3.13"
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://dialx.ai/"
+Documentation = "https://dialx.ai/dial_api"
+Repository = "https://github.com/epam/ai-dial-model-adapter"
+
+[tool.poetry]
+package-mode = false
+
+# The composition root's own dependencies. Importing an adapter adds that
+# provider's stack here: openai+tiktoken, google-cloud-aiplatform, boto3,
+# anthropic[vertex,bedrock] … all of them in one resolution, which is what
+# forces the version reconciliation listed in docs/design.md §4.
+[tool.poetry.dependencies]
+# The composition root's own, at the versions the adapters agreed on.
+fastapi = "0.136.3"
+uvicorn = { version = "0.23.2", extras = ["standard"] }
+aidial-sdk = { version = "0.45.0", extras = ["telemetry"] }
+
+# The union of what the four vendored adapters declare. One interpreter
+# means one resolved version of each, so anything they disagreed on is resolved
+# here — see CLAUDE.md.
+openai = { version = "2.48.0", extras = ["aiohttp"] }
+pydantic = "2.11.2"
+httpx = "0.28.1"
+aiohttp = "3.14.4"
+pillow = "13.0.0"
+anthropic = { version = "0.105.0", extras = ["vertex", "bedrock", "aiohttp"] }
+aidial-adapter-anthropic = { version = "0.20.0", extras = ["bedrock"] }
+
+# Divergences the all-four sync never covered: each is declared by only two or
+# three adapters, so it was never in the intersection. Resolved to the maximum.
+numpy = "2.3.3"           # openai 2.3.3 / vertexai, bedrock 2.0.0
+boto3 = "1.43.74"         # openai 1.43.74 / bedrock 1.43.56
+azure-identity = "1.25.1" # vertexai 1.25.1 / openai 1.16.1
+aidial-client = "0.16.1"  # openai 0.16.1 / bedrock ^0.14.0 — ranges disjoint
+# bedrock pins botocore 1.43.56 explicitly; boto3 pulls a matching one, so it
+# is left transitive here rather than pinned against its own boto3.
+
+# openai adapter only
+tiktoken = "0.12.0"
+wrapt = "1.16.0"
+jmespath = "1.1.0"
+aws-bedrock-token-generator = "^1.1.0"
+
+# vertexai adapter only
+google-cloud-aiplatform = "1.138.0"
+google-auth = "2.49.0"
+google-genai = "1.72.0"
+pypdf = { version = "6.21.1", extras = ["crypto"] }
+mistralai = { version = "2.4.3", extras = ["gcp"] }
+
+[tool.poetry.group.test.dependencies]
+# Union of the four test groups: `make test` runs each adapter's suite with that
+# adapter's own pytest config, but out of this one venv.
+pytest = "9.0.3"
+pytest-asyncio = "1.3.0"
+pytest-env = "1.1.1"
+pytest-xdist = "^3.5.0"
+pytest-timeout = "^2.4.0"
+pytest-sugar = "^1.0.0"
+pytest-dotenv = "^0.5.2"
+pytest-html = "^4.1.1"
+allure-pytest = "^2.13.5"
+python-dotenv = "1.2.2"
+respx = "^0.22.0"  # dial declares ^0.21.1 — disjoint, max wins
+asgi-lifespan = "2.1.0"
+rapidfuzz = "^3.14.1"
+aiointercept = "^0.1.5"
+httpx2 = "^2.7.0"  # starlette.testclient wants httpx 2.x
+
+[tool.poetry.group.lint.dependencies]
+ruff = "0.12.11"
+pyright = "1.1.408"  # the version all four adapters lint with
+
+[tool.poetry.group.dev.dependencies]
+pre-commit = "^4.5.1"
+
+# One pytest config for all five suites -- this repo's own and the four
+# adapters' -- as the union of what the four declared upstream. Their
+# allure/pytest-html reporters are dropped: they decide nothing about pass or
+# fail and only litter the tree.
+#
+# `make test` still runs pytest once per adapter, and testpaths covers only this
+# repo's own tests, because the adapters read process-global env at import time
+# and disagree about DIAL_URL -- see the Makefile. The integration suites are
+# left out of both: they hit live providers and need credentials, so they are
+# opt-in via `make integration_tests ADAPTER=x`.
+[tool.pytest.ini_options]
+addopts = "-n=auto --asyncio-mode=auto --timeout=300"
+testpaths = ["tests/unit_tests"]
+# respx mocks the httpx transport, not the default aiohttp one (openai adapter)
+env = ["PYDANTIC_V2=1", "HTTP_TRANSPORT=httpx"]
+env_override_existing_values = 1
+markers = ["slow: marker for slow running tests"]
+filterwarnings = [
+  "error",
+  # opentelemetry / pkg_resources
+  "ignore::DeprecationWarning:opentelemetry.instrumentation.dependencies",
+  "ignore::DeprecationWarning:pkg_resources",
+  "ignore:pkg_resources is deprecated as an API:UserWarning",
+  "ignore:Deprecated call to `pkg_resources\\.declare_namespace\\('.*'\\):DeprecationWarning",
+  # https://github.com/openai/openai-python/issues/1039, and the same warning
+  # reaching bedrock and vertexai through the anthropic adapter
+  "ignore:Pydantic serializer warnings:UserWarning",
+  # aiohttp
+  "ignore:Sending a large body directly with raw bytes might lock the event loop. You should probably pass an io.BytesIO object instead:ResourceWarning",
+  "ignore:Inheritance class AiohttpClientSession from ClientSession is discouraged:DeprecationWarning",
+  # google.rpc: https://github.com/googleapis/google-cloud-python/issues/11184
+  "ignore::DeprecationWarning:google.rpc",
+  # vertexai is deprecated; remove once
+  # https://github.com/epam/ai-dial-adapter-vertexai/issues/398 is fixed
+  "ignore:This feature is deprecated as of June 24:UserWarning",
+  # starlette.testclient, reached by this repo's own tests
+  "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportDeprecated = "error"
+reportUnusedVariable = "error"
+reportIncompatibleMethodOverride = "error"
+exclude = [".venv", "**/__pycache__"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 80
+extend-exclude = [".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+  "ERA",  # flake8-eradicate
+  "B",    # flake8-builtins
+  "C4",   # flake8-comprehensions
+  "SIM",  # flake8-simplify
+  "B9",   # flake8-bugbear
+  "E",    # pycodestyle
+  "W",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # flake8-isort
+  "S",    # flake8-bandit
+  "FURB", # refurb
+  "UP",   # pyupgrade
+]
+ignore = [
+  "E501", # string literal is too long
+  "E203", # whitespace before ':' (triggered on list slices like xs[i : i + 5])
+  "S101", # Use of `assert` detected
+  "S110", # `try`-`except`-`pass` detected
+  "B904", # Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None`
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/*" = [
+  "B011", # Do not `assert False`
+  "B006", # Do not use mutable data structures for argument defaults
+  "E731", # Do not assign a `lambda` expression, use a `def`
+]
+"*/__init__.py" = [
+  "F401", # imported but unused
+]

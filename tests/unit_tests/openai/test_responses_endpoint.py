@@ -1,0 +1,591 @@
+import asyncio
+import gzip
+import inspect
+import json
+from collections.abc import AsyncIterator, Awaitable, Generator, Mapping
+from typing import (
+    Protocol,
+)
+
+import httpx
+import openai
+import pytest
+import respx
+from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai.types.responses.response_create_params import (
+    ResponseCreateParamsBase,
+)
+
+from aidial_model_provider.openai.utils.request import get_app_config
+from tests.fixtures.openai import AzureOpenAIClientFactory, OpenAIClientFactory
+from tests.utils.openai.mock_response import (
+    MockResponse,
+    ResponsesAPIMockResponse,
+)
+from tests.utils.openai.mock_server import MockServer
+
+_Response = httpx.Response | MockResponse | dict
+
+
+class _RequestHandler(Protocol):
+    def __call__(
+        self, *, body: dict, headers: Mapping[str, str], stream: bool
+    ) -> Awaitable[_Response] | _Response: ...
+
+
+class TestResponsesEndpoint:
+    UPSTREAM_KEY = "test-upstream-key"
+    UPSTREAM_ENDPOINT = "http://test-upstream-hostname/openai/v1/responses"
+    UPSTREAM_MODEL = "test-upstream-model-name"
+    RESPONSE_ID = "resp_test_123"
+
+    MOCK_RESPONSE = MockServer.mock_responses_api_response("text.txt")
+
+    @pytest.fixture
+    def sse_heartbeat_interval_1(self, _app_instance):
+        app_config = get_app_config(_app_instance)  # type: ignore
+        app_config.SSE_HEARTBEAT_INTERVAL = 1
+        yield
+        app_config.SSE_HEARTBEAT_INTERVAL = None
+
+    @pytest.fixture()
+    def client(self, create_openai_client: OpenAIClientFactory):
+        return create_openai_client(
+            upstream_endpoint=self.UPSTREAM_ENDPOINT,
+            upstream_key=self.UPSTREAM_KEY,
+        )
+
+    @pytest.fixture(params=[True, False], ids=["stream", "block"])
+    def stream(self, request) -> bool:
+        return request.param
+
+    @property
+    def test_request(self) -> ResponseCreateParamsBase:
+        return ResponseCreateParamsBase(
+            model=self.UPSTREAM_MODEL, input="Test content"
+        )
+
+    def mock_upstream_response(self, handler: _RequestHandler | MockResponse):
+        if isinstance(handler, MockResponse):
+            MockServer().post(self.UPSTREAM_ENDPOINT)(handler)
+        else:
+
+            @MockServer().post(self.UPSTREAM_ENDPOINT)
+            async def _handler(request: httpx.Request):
+                body = json.loads(request.content)
+                stream = body.get("stream")
+                response = handler(
+                    body=body,
+                    stream=stream,
+                    headers=request.headers,
+                )
+                if inspect.isawaitable(response):
+                    return await response
+                else:
+                    return response
+
+    @respx.mock
+    async def test_authz(self, client: AsyncOpenAI, stream: bool):
+        @self.mock_upstream_response
+        def _handler(headers, **kwargs):
+            assert headers.get("authorization") == f"Bearer {self.UPSTREAM_KEY}"
+            return self.MOCK_RESPONSE
+
+        await client.responses.create(**self.test_request, stream=stream)
+
+    @respx.mock
+    async def test_model_name(self, client: AsyncOpenAI, stream: bool):
+        @self.mock_upstream_response
+        def _handler(body, **kwargs):
+            assert body["model"] == self.UPSTREAM_MODEL
+            return self.MOCK_RESPONSE
+
+        await client.responses.create(**self.test_request, stream=stream)
+
+    @respx.mock
+    async def test_proxy_headers_from_upstream(
+        self, client: AsyncOpenAI, stream: bool
+    ):
+        @self.mock_upstream_response
+        def _handler(stream, **kwargs):
+            return httpx.Response(
+                status_code=200,
+                headers={"foo": "bar"},
+                content=self.MOCK_RESPONSE.parse(stream).text,
+            )
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=stream
+        )
+
+        assert response.status_code == 200
+        assert response.headers.get("foo") == "bar"
+
+    @respx.mock
+    async def test_gzip_encoding(self, client: AsyncOpenAI, stream: bool):
+        if stream:
+            pytest.skip("respx doesn't properly mock compressed responses.")
+
+        content_type = "text/event-stream" if stream else "application/json"
+
+        @self.mock_upstream_response
+        def _handler(body, stream, **kwargs):
+            gzipped = gzip.compress(
+                self.MOCK_RESPONSE.parse(stream).text.encode()
+            )
+
+            return httpx.Response(
+                status_code=200,
+                stream=httpx.ByteStream(gzipped),
+                headers={
+                    "Content-Length": "1",  # plainly false value
+                    "Content-Encoding": "gzip",
+                    "Content-Type": content_type,
+                },
+            )
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=stream
+        )
+
+        assert response.status_code == 200
+        assert "Content-Encoding" not in response.headers
+        assert response.headers.get("Content-Length") != "1"
+        assert response.headers.get("Content-Type") == content_type
+
+    @respx.mock
+    async def test_too_many_requests_error(
+        self, client: AsyncOpenAI, stream: bool
+    ):
+        @self.mock_upstream_response
+        def _handler(**kwargs):
+            return httpx.Response(
+                status_code=429,
+                content="Too many requests",
+                headers={"retry-after": "15"},
+            )
+
+        with pytest.raises(openai.RateLimitError) as exc:
+            await client.responses.create(**self.test_request, stream=stream)
+
+        error = exc.value
+        assert error.status_code == 429
+        assert error.message == "Too many requests"
+        assert error.response.headers.get("retry-after") == "15"
+
+    @respx.mock
+    async def test_responses_streaming(self, client: AsyncOpenAI, stream: bool):
+        resp = self.MOCK_RESPONSE
+        self.mock_upstream_response(resp)
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=stream
+        )
+
+        actual_content = await response.http_response.aread()
+
+        if stream:
+            assert b"event: " in actual_content
+            assert b"data: [DONE]" not in actual_content
+
+        expected = resp.parse(stream)
+        actual = ResponsesAPIMockResponse(actual_content).parse(stream)
+        assert actual.json == expected.json
+
+    @respx.mock
+    async def test_extra_request_field(self, client: AsyncOpenAI, stream: bool):
+        @self.mock_upstream_response
+        def _handler(body, **kwargs):
+            assert body.get("extra-field") == "extra-value"
+            return self.MOCK_RESPONSE
+
+        await client.responses.create(
+            **self.test_request,
+            extra_body={"extra-field": "extra-value"},
+            stream=stream,
+        )  # type: ignore
+
+    @respx.mock
+    async def test_sse_heartbeat_interval(
+        self, sse_heartbeat_interval_1, client: AsyncOpenAI
+    ):
+        @self.mock_upstream_response
+        async def _handler(body, **kwargs):
+            resp = self.MOCK_RESPONSE.parse_stream()
+
+            async def _stream() -> AsyncIterator[bytes]:
+                [chunk1, chunk2] = list(_chunk_lines(resp.text, n=2))
+                yield chunk1.encode()
+                await asyncio.sleep(2)
+                yield chunk2.encode()
+
+            return httpx.Response(status_code=200, content=_stream())
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=True
+        )  # type: ignore
+
+        actual_content = await response.http_response.aread()
+        actual = ResponsesAPIMockResponse(actual_content).parse_stream()
+        assert _is_sublist(
+            ["event", "comment ping", "event"], actual.signature()
+        )
+
+    @respx.mock
+    async def test_sse_heartbeat_never_splits_an_event(
+        self, sse_heartbeat_interval_1, client: AsyncOpenAI
+    ):
+        """
+        The upstream goes quiet in the middle of an event. The heartbeat has
+        to wait for that event to end instead of splicing itself into it.
+        """
+        expected = self.MOCK_RESPONSE.parse_stream()
+
+        @self.mock_upstream_response
+        async def _handler(body, **kwargs):
+            text = expected.text
+            # A cut inside the JSON payload of a `data:` line
+            cut = text.index("data: ") + len("data: ") + 5
+
+            async def _stream() -> AsyncIterator[bytes]:
+                yield text[:cut].encode()
+                await asyncio.sleep(2)
+                yield text[cut:].encode()
+
+            return httpx.Response(status_code=200, content=_stream())
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=True
+        )  # type: ignore
+
+        actual_content = await response.http_response.aread()
+        actual = ResponsesAPIMockResponse(actual_content).parse_stream()
+
+        assert "comment ping" in actual.signature()
+        assert actual.text.replace(": ping\n\n", "") == expected.text
+
+    @respx.mock
+    async def test_stream_events_passed_through_as_received(
+        self, client: AsyncOpenAI
+    ):
+        # An event type and a field unknown to the SDK, the upstream's own
+        # JSON formatting, a comment and a `data: [DONE]` sentinel: all of it
+        # reaches the client intact, since nothing is interpreted.
+        events = (
+            ": upstream keep-alive\n\n"
+            "event: response.vendor_specific\n"
+            'data: {"type": "response.vendor_specific", "x": 1}\n\n'
+            "event: response.completed\n"
+            'data: {"type":"response.completed","sequence_number":2}\n\n'
+            "data: [DONE]\n\n"
+        )
+
+        @self.mock_upstream_response
+        def _handler(**kwargs):
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "text/event-stream"},
+                content=events.encode(),
+            )
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=True
+        )  # type: ignore
+
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert (await response.http_response.aread()).decode() == events
+
+    @respx.mock
+    async def test_stream_error_payload_passed_through(
+        self, client: AsyncOpenAI
+    ):
+        # An upstream error payload is relayed like any other event, rather
+        # than being turned into an adapter error that ends the stream.
+        events = (
+            b"event: response.created\n"
+            b'data: {"type":"response.created"}\n\n'
+            b'data: {"error":{"message":"upstream failed"}}\n\n'
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed"}\n\n'
+        )
+
+        @self.mock_upstream_response
+        def _handler(**kwargs):
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "text/event-stream"},
+                content=events,
+            )
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=True
+        )  # type: ignore
+
+        assert await response.http_response.aread() == events
+
+    @respx.mock
+    async def test_stream_broken_mid_way(self, client: AsyncOpenAI):
+        # An upstream that breaks mid-stream breaks this one too: the client
+        # is left with the events that made it, and no adapter error event.
+        created = (
+            b'event: response.created\ndata: {"type":"response.created"}\n\n'
+        )
+
+        @self.mock_upstream_response
+        def _handler(**kwargs):
+            async def _stream() -> AsyncIterator[bytes]:
+                yield created
+                raise httpx.ReadError("connection reset")
+
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "text/event-stream"},
+                content=_stream(),
+            )
+
+        response = await client.responses.with_raw_response.create(
+            **self.test_request, stream=True
+        )  # type: ignore
+
+        assert response.status_code == 200
+        assert await response.http_response.aread() == created
+
+    @respx.mock
+    async def test_request_body_forwarded_as_received(
+        self, test_app: httpx.AsyncClient, stream: bool
+    ):
+        # Spacing, key order and a field unknown to the SDK, all preserved:
+        # a request with no attachment to inline is never re-serialized.
+        body = (
+            f'{{"input": "Test content", "model": "{self.UPSTREAM_MODEL}",'
+            f' "stream": {str(stream).lower()}, "brand_new_field": 42}}'
+        )
+
+        @respx.post(self.UPSTREAM_ENDPOINT)
+        def _handler(request: httpx.Request):
+            assert request.content.decode() == body
+            return httpx.Response(
+                status_code=200,
+                content=self.MOCK_RESPONSE.parse(stream).text,
+            )
+
+        response = await test_app.post(
+            "/openai/v1/responses",
+            content=body.encode(),
+            headers={
+                "Api-Key": "test-adapter-api-key",
+                "Content-Type": "application/json",
+                "X-UPSTREAM-KEY": self.UPSTREAM_KEY,
+                "X-UPSTREAM-ENDPOINT": self.UPSTREAM_ENDPOINT,
+            },
+        )
+
+        # A 200 means the upstream handler ran and its assertion held: an
+        # AssertionError inside it would surface as a 500.
+        assert response.status_code == 200
+        assert response.text == self.MOCK_RESPONSE.parse(stream).text
+
+    @respx.mock
+    async def test_proxies_extra_headers(self, client: AsyncOpenAI):
+        client = client.with_options(
+            default_headers={
+                "X-UPSTREAM-EXTRA-DATA": '{"headers_to_proxy": ["x-user-id"]}',
+                "x-user-id": "user-1",
+            }
+        )
+
+        @self.mock_upstream_response
+        def _handler(headers, **kwargs):
+            assert headers.get("x-user-id") == "user-1"
+            return self.MOCK_RESPONSE
+
+        await client.responses.create(**self.test_request)
+
+    @respx.mock
+    async def test_count_input_tokens(self, client: AsyncOpenAI):
+        upstream_response_body = json.dumps(
+            {
+                "object": "response.input_tokens",
+                "input_tokens": 123,
+            }
+        ).encode()
+
+        @respx.post(f"{self.UPSTREAM_ENDPOINT}/input_tokens")
+        def _handler(request: httpx.Request):
+            body = json.loads(request.content)
+            assert request.headers.get("authorization") == (
+                f"Bearer {self.UPSTREAM_KEY}"
+            )
+            assert body == {
+                "input": "Test content",
+                "instructions": "Count this prompt.",
+                "model": self.UPSTREAM_MODEL,
+            }
+            return httpx.Response(
+                status_code=200,
+                stream=httpx.ByteStream(gzip.compress(upstream_response_body)),
+                headers={
+                    "foo": "bar",
+                    "Content-Length": "1",  # plainly false value
+                    "Content-Encoding": "gzip",
+                },
+            )
+
+        response = await client.responses.with_raw_response.input_tokens.count(
+            model=self.UPSTREAM_MODEL,
+            input="Test content",
+            instructions="Count this prompt.",
+        )
+
+        actual_content = await response.http_response.aread()
+
+        assert response.status_code == 200
+        # Relayed verbatim, down to the upstream's key order and spacing
+        assert actual_content == upstream_response_body
+
+    @respx.mock
+    async def test_retrieve_response(self, client: AsyncOpenAI, stream: bool):
+        expected = self.MOCK_RESPONSE.parse(stream)
+
+        @respx.get(f"{self.UPSTREAM_ENDPOINT}/{self.RESPONSE_ID}")
+        def _handler(request: httpx.Request):
+            assert request.headers.get("authorization") == (
+                f"Bearer {self.UPSTREAM_KEY}"
+            )
+            assert request.url.params.get("include_obfuscation") == "true"
+            assert request.url.params.get("starting_after") == "7"
+            assert request.url.params.get("stream") == str(stream).lower()
+
+            content_type = "text/event-stream" if stream else "application/json"
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": content_type},
+                content=expected.text,
+            )
+
+        response = await client.responses.with_raw_response.retrieve(
+            self.RESPONSE_ID,
+            include_obfuscation=True,
+            starting_after=7,
+            stream=stream,
+        )
+
+        actual_content = await response.http_response.aread()
+        actual = ResponsesAPIMockResponse(actual_content).parse(stream)
+        assert actual.json == expected.json
+
+    @respx.mock
+    async def test_delete_response(self, client: AsyncOpenAI):
+        @respx.delete(f"{self.UPSTREAM_ENDPOINT}/{self.RESPONSE_ID}")
+        def _handler(request: httpx.Request):
+            assert request.headers.get("authorization") == (
+                f"Bearer {self.UPSTREAM_KEY}"
+            )
+            assert request.content == b""
+            return httpx.Response(
+                status_code=204,
+                headers={"foo": "bar"},
+            )
+
+        response = await client.responses.with_raw_response.delete(
+            self.RESPONSE_ID
+        )
+
+        assert response.status_code == 204
+        assert response.headers.get("foo") == "bar"
+        assert await response.http_response.aread() == b""
+
+    @respx.mock
+    async def test_cancel_response(self, client: AsyncOpenAI):
+        expected = self.MOCK_RESPONSE.parse(False)
+
+        @respx.post(f"{self.UPSTREAM_ENDPOINT}/{self.RESPONSE_ID}/cancel")
+        def _handler(request: httpx.Request):
+            assert request.headers.get("authorization") == (
+                f"Bearer {self.UPSTREAM_KEY}"
+            )
+            assert request.content == b""
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                content=expected.text,
+            )
+
+        response = await client.responses.cancel(self.RESPONSE_ID)
+
+        assert response.to_dict() == expected.json
+
+
+class TestDatedResponsesEndpoint:
+    """
+    `AzureOpenAI(api_version=...)` clients call the dated form of the
+    Responses API - `POST /openai/responses?api-version=<date>` - which
+    must be served by the very same implementation as `/openai/v1/responses`.
+    """
+
+    UPSTREAM_KEY = "test-upstream-key"
+    UPSTREAM_ENDPOINT = "http://test-upstream-hostname/openai/responses"
+    UPSTREAM_MODEL = "test-upstream-model-name"
+    API_VERSION = "2025-04-01-preview"
+
+    @pytest.fixture()
+    def client(self, create_azure_openai_client: AzureOpenAIClientFactory):
+        return create_azure_openai_client(
+            "test-azure-deployment",
+            api_version=self.API_VERSION,
+            upstream_endpoint=self.UPSTREAM_ENDPOINT,
+            upstream_key=self.UPSTREAM_KEY,
+        )
+
+    @respx.mock
+    async def test_create(self, client: AsyncAzureOpenAI):
+        expected = MockServer.mock_responses_api_response("text.txt").parse(
+            False
+        )
+
+        @respx.post(self.UPSTREAM_ENDPOINT)
+        def _handler(request: httpx.Request):
+            assert request.url.params.get("api-version") == self.API_VERSION
+            assert request.headers.get("api-key") == self.UPSTREAM_KEY
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                content=expected.text,
+            )
+
+        response = await client.responses.create(
+            model=self.UPSTREAM_MODEL, input="Test content"
+        )
+
+        assert response.to_dict() == expected.json
+
+    @respx.mock
+    async def test_missing_api_version(self, test_app: httpx.AsyncClient):
+        """The dated upstream API requires the version to be set."""
+        response = await test_app.post(
+            "/openai/responses",
+            json={"model": self.UPSTREAM_MODEL, "input": "Test content"},
+            headers={
+                "Api-Key": "test-adapter-api-key",
+                "X-UPSTREAM-KEY": self.UPSTREAM_KEY,
+                "X-UPSTREAM-ENDPOINT": self.UPSTREAM_ENDPOINT,
+            },
+        )
+
+        assert response.status_code == 400
+        assert (
+            response.json()["error"]["message"]
+            == "api-version is a required query parameter"
+        )
+
+
+def _chunk_lines(text: str, *, n: int) -> Generator[str, None, None]:
+    lines = text.splitlines(keepends=True)
+    size = (len(lines) + n - 1) // n
+    for i in range(n):
+        block = lines[i * size : (i + 1) * size]
+        yield "".join(block)
+
+
+def _is_sublist(small: list[str], big: list[str]) -> bool:
+    return ";".join(small) in ";".join(big)

@@ -1,0 +1,442 @@
+import json
+import re
+from collections.abc import Mapping
+from typing import Any, Required, TypedDict, Unpack
+
+import httpx
+from aidial_sdk.chat_completion.request import Attachment, Stage, StaticTool
+from aidial_sdk.deployment.tokenize import TokenizeResponse
+from aidial_sdk.utils.merge_chunks import (
+    cleanup_indices,
+    merge_chat_completion_chunks,
+)
+from openai import AsyncAzureOpenAI, AsyncStream
+from openai._types import omit
+from openai.types import CompletionUsage
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionAssistantMessageParam,
+    ChatCompletionContentPartParam,
+    ChatCompletionFunctionMessageParam,
+    ChatCompletionMessageParam,
+    ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallParam,
+    ChatCompletionReasoningEffort,
+    ChatCompletionSystemMessageParam,
+    ChatCompletionToolChoiceOptionParam,
+    ChatCompletionToolMessageParam,
+    ChatCompletionToolParam,
+    ChatCompletionUserMessageParam,
+)
+from openai.types.chat.chat_completion_message import (
+    ChatCompletionMessage,
+    FunctionCall,
+)
+from openai.types.chat.chat_completion_message_tool_call_param import (
+    Function as ToolFunction,
+)
+from openai.types.shared_params.function_definition import FunctionDefinition
+from pydantic import BaseModel, ConfigDict
+
+from aidial_model_provider.vertexai.chat.static_tools import StaticToolsConfig
+from aidial_model_provider.vertexai.utils.resource import Resource
+
+
+def sys(content: str) -> ChatCompletionSystemMessageParam:
+    return {"role": "system", "content": content}
+
+
+def ai(content: str) -> ChatCompletionAssistantMessageParam:
+    return {"role": "assistant", "content": content}
+
+
+def ai_function(
+    function_call: ToolFunction,
+) -> ChatCompletionAssistantMessageParam:
+    return {"role": "assistant", "function_call": function_call}
+
+
+def ai_tools(
+    tool_calls: list[ChatCompletionMessageToolCallParam],
+) -> ChatCompletionAssistantMessageParam:
+    return {"role": "assistant", "tool_calls": tool_calls}
+
+
+def user(
+    content: str | list[ChatCompletionContentPartParam],
+) -> ChatCompletionUserMessageParam:
+    return {"role": "user", "content": content}
+
+
+def user_with_attachment_data(
+    content: str | None, *resource: Resource
+) -> ChatCompletionUserMessageParam:
+    return {
+        "role": "user",
+        "content": content or "",
+        "custom_content": {  # type: ignore
+            "attachments": [
+                {"type": r.type, "data": r.data_base64} for r in resource
+            ]
+        },
+    }
+
+
+def user_with_attachment_url(
+    content: str | None, resource: Resource
+) -> ChatCompletionUserMessageParam:
+    return {
+        "role": "user",
+        "content": content or "",
+        "custom_content": {  # type: ignore
+            "attachments": [
+                {
+                    "type": resource.type,
+                    "url": resource.to_data_url(),
+                }
+            ]
+        },
+    }
+
+
+def user_with_file_content_part(
+    content: str, name: str, resource: Resource
+) -> ChatCompletionUserMessageParam:
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": content},
+            {
+                "type": "file",
+                "file": {
+                    "filename": name,
+                    "file_data": resource.to_data_url(),
+                },
+            },
+        ],
+    }
+
+
+def user_with_image_url(
+    content: str | None, image: Resource
+) -> ChatCompletionUserMessageParam:
+    parts = []
+    if content is not None:
+        parts.append({"type": "text", "text": content})
+    parts.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": image.to_data_url()},
+        }
+    )
+
+    return {"role": "user", "content": parts}
+
+
+def function_request(name: str, args: Any) -> ToolFunction:
+    return {"name": name, "arguments": json.dumps(args)}
+
+
+def tool_request(
+    id: str, name: str, args: Any
+) -> ChatCompletionMessageToolCallParam:
+    return {
+        "id": id,
+        "type": "function",
+        "function": function_request(name, args),
+    }
+
+
+def function_response(
+    name: str, content: str
+) -> ChatCompletionFunctionMessageParam:
+    return {"role": "function", "name": name, "content": content}
+
+
+def tool_response(
+    id: str, content: str, resources: list[Resource] | None = None
+) -> ChatCompletionToolMessageParam:
+    ret: ChatCompletionToolMessageParam = {
+        "role": "tool",
+        "tool_call_id": id,
+        "content": content,
+    }
+    if resources:
+        ret["custom_content"] = {  # type: ignore
+            "attachments": [
+                {"type": r.type, "url": r.to_data_url()} for r in resources
+            ]
+        }
+    return ret
+
+
+def function_to_tool(function: FunctionDefinition) -> ChatCompletionToolParam:
+    return {"type": "function", "function": function}
+
+
+def sanitize_test_name(name: str) -> str:
+    name = "".join(
+        c if (c.isalnum() or c in "/:") else "_" for c in name.lower()
+    )
+    return re.sub("_+", "_", name)
+
+
+class ChatCompletionResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    response: ChatCompletion
+
+    @property
+    def message(self) -> ChatCompletionMessage:
+        return self.response.choices[0].message
+
+    @property
+    def content(self) -> str:
+        return self.message.content or ""
+
+    @property
+    def contents(self) -> list[str]:
+        return [
+            choice.message.content or "" for choice in self.response.choices
+        ]
+
+    @property
+    def finish_reasons(self) -> list[str]:
+        return [choice.finish_reason for choice in self.response.choices]
+
+    @property
+    def usage(self) -> CompletionUsage | None:
+        return self.response.usage
+
+    @property
+    def function_call(self) -> FunctionCall | None:
+        return self.message.function_call
+
+    @property
+    def tool_calls(self) -> list[ChatCompletionMessageToolCall] | None:
+        if (calls := self.message.tool_calls) is None:
+            return None
+        return [
+            call
+            for call in calls
+            if isinstance(call, ChatCompletionMessageToolCall)
+        ]
+
+    def content_contains_all(self, matches: list[Any]) -> None:
+        for match in matches:
+            assert str(match).lower() in self.content.lower()
+
+    @property
+    def attachments(self) -> list[Attachment] | None:
+        if not hasattr(self.message, "custom_content"):
+            return None
+        return [
+            Attachment.model_validate(attachment)
+            for attachment in self.message.custom_content.get(  # type: ignore
+                "attachments", []
+            )
+        ] or None
+
+    @property
+    def stages(self) -> list[Stage] | None:
+        if not hasattr(self.message, "custom_content"):
+            return None
+        return [
+            Stage.model_validate(stage)
+            for stage in self.message.custom_content.get(  # type: ignore
+                "stages", []
+            )
+        ] or None
+
+
+async def tokenize_request(
+    http_client: httpx.AsyncClient,
+    model_id: str,
+    messages: list[ChatCompletionMessageParam],
+    functions: list[FunctionDefinition] | None,
+    tools: list[ChatCompletionToolParam] | None,
+    extra_headers: Mapping[str, str] | None = None,
+) -> TokenizeResponse:
+    chat_completion_request = {
+        "model": model_id,
+        "messages": messages,
+        "tools": tools,
+        "functions": functions,
+    }
+
+    request = {
+        "inputs": [{"type": "request", "value": chat_completion_request}],
+    }
+
+    resp = await http_client.post(
+        f"openai/deployments/{model_id}/tokenize",
+        json=request,
+        headers=extra_headers or {},
+    )
+
+    resp.raise_for_status()
+
+    return TokenizeResponse.model_validate(resp.json())
+
+
+async def configuration(
+    client: httpx.AsyncClient,
+    model: str,
+    extra_headers: Mapping[str, str] | None = None,
+) -> dict | None:
+    response = await client.get(
+        url=f"/openai/deployments/{model}/configuration",
+        headers=extra_headers or {},
+    )
+
+    if response.status_code == 404:
+        return None
+
+    response.raise_for_status()
+    return response.json()
+
+
+class ChatCompletionArgs(TypedDict, total=False):
+    messages: Required[list[ChatCompletionMessageParam]]
+    stop: list[str] | None
+    max_tokens: int | None
+    n: int | None
+    functions: list[FunctionDefinition] | None
+    tools: list[ChatCompletionToolParam] | None
+    tool_choice: ChatCompletionToolChoiceOptionParam | None
+    static_tools: StaticToolsConfig | None
+    configuration: dict | None
+    reasoning_effort: ChatCompletionReasoningEffort | None
+    extra_body: dict | None
+
+
+async def chat_completion(
+    client: AsyncAzureOpenAI,
+    *,
+    stream: bool | None = None,
+    **kwargs: Unpack[ChatCompletionArgs],
+) -> ChatCompletionResult:
+    # Using extra_body to override tools, since openai
+    # doesn't support static tools
+    merged_tools = (
+        [
+            StaticTool(
+                type="static_function",
+                static_function=function,
+            ).model_dump()
+            for function in (static_tools.functions or [])
+        ]
+        if (static_tools := kwargs.get("static_tools"))
+        else []
+    )
+    if tools := kwargs.get("tools"):
+        merged_tools += tools
+
+    extra_body = kwargs.get("extra_body") or {}
+    if merged_tools:
+        extra_body["tools"] = merged_tools
+
+    if configuration := kwargs.get("configuration"):
+        extra_body["custom_fields"] = {"configuration": configuration}
+
+    async def get_response() -> ChatCompletion:
+        functions = kwargs.get("functions")
+        tools = kwargs.get("tools")
+        tool_choice = kwargs.get("tool_choice")
+
+        response = await client.chat.completions.create(
+            model="dummy-model",
+            messages=kwargs["messages"],
+            stream=stream or False,
+            stop=kwargs.get("stop"),
+            max_tokens=kwargs.get("max_tokens"),
+            reasoning_effort=kwargs.get("reasoning_effort"),
+            temperature=0.0,
+            n=kwargs.get("n"),
+            function_call=omit,
+            functions=functions or omit,
+            tool_choice=tool_choice or omit,
+            tools=tools or omit,
+            extra_body=extra_body,
+        )
+
+        if isinstance(response, AsyncStream):
+            chunks: list[dict] = []
+            async for chunk in response:
+                chunks.append(chunk.model_dump())
+
+            response_dict = merge_chat_completion_chunks(*chunks)
+
+            for choice in response_dict["choices"]:
+                choice["message"] = cleanup_indices(choice["delta"])
+                del choice["delta"]
+
+            response_dict["object"] = "chat.completion"
+
+            return ChatCompletion.model_validate(response_dict)
+        else:
+            return response
+
+    response = await get_response()
+    return ChatCompletionResult(response=response)
+
+
+GET_CURRENT_TIME_FUNCTION: FunctionDefinition = {
+    "name": "get_current_time",
+    "description": "return the current time",
+}
+
+GET_WEATHER_FUNCTION_WITH_REFERENCES: FunctionDefinition = {
+    "name": "get_temperature",
+    "description": "Get reliable information about the temperature in the given city",
+    "strict": True,
+    "parameters": {
+        "$defs": {
+            "Location": {
+                "type": "string",
+                "description": "The city, e.g. San Francisco",
+            },
+            "Unit": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],
+                "description": "The temperature unit to use. Infer this from the location.",
+            },
+        },
+        "type": "object",
+        "properties": {
+            "location": {"$ref": "#/$defs/Location"},
+            "unit": {"$ref": "#/$defs/Unit"},
+        },
+        "required": ["location", "unit"],
+    },
+}
+
+GET_WEATHER_TOOL_WITH_REFERENCES: ChatCompletionToolParam = function_to_tool(
+    GET_WEATHER_FUNCTION_WITH_REFERENCES
+)
+
+GET_WEATHER_FUNCTION: FunctionDefinition = {
+    "name": "get_temperature",
+    "description": "Get reliable information about the temperature in the given city",
+    "strict": True,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "location": {
+                "type": "string",
+                "description": "The city, e.g. San Francisco",
+            },
+            "unit": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],
+                "description": "The temperature unit to use. Infer this from the location.",
+            },
+        },
+        "required": ["location", "unit"],
+        "additionalProperties": False,
+    },
+}
+
+GET_WEATHER_TOOL: ChatCompletionToolParam = function_to_tool(
+    GET_WEATHER_FUNCTION
+)

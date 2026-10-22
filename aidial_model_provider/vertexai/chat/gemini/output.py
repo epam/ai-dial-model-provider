@@ -1,0 +1,136 @@
+import base64
+import json
+from logging import DEBUG
+from urllib.parse import urlparse
+
+from aidial_sdk.chat_completion import Attachment
+from google.genai.types import Candidate as GenAICandidate
+from google.genai.types import (
+    GenerateContentResponseUsageMetadata as GenAIUsageMetadata,
+)
+from google.genai.types import Part as GenAIPart
+
+from aidial_model_provider.utils.log_config import logger as log
+from aidial_model_provider.vertexai.chat.consumer import Consumer
+from aidial_model_provider.vertexai.chat.gemini.grounding import (
+    google_search_grounding_tokens,
+)
+from aidial_model_provider.vertexai.chat.tools import ToolsConfig
+from aidial_model_provider.vertexai.deployments import GeminiDeployment
+from aidial_model_provider.vertexai.dial_api.storage import (
+    FileStorage,
+    compute_hash_digest,
+)
+from aidial_model_provider.vertexai.dial_api.token_usage import TokenUsage
+from aidial_model_provider.vertexai.utils.json import json_dumps
+
+
+def _is_absolute_url(uri: str) -> bool:
+    parsed = urlparse(uri)
+    return bool(parsed.scheme and parsed.netloc)
+
+
+async def create_citations(
+    candidate: GenAICandidate, consumer: Consumer
+) -> None:
+    if (citation_metadata := candidate.citation_metadata) is None:
+        return None
+
+    for citation in citation_metadata.citations or []:
+        if uri := citation.uri:
+            if _is_absolute_url(uri):
+                await consumer.add_attachment(
+                    Attachment(
+                        title=citation.title,
+                        type="text/markdown",
+                        url=uri,
+                        reference_url=uri,
+                        reference_type="text/markdown",
+                    )
+                )
+            else:
+                log.error(f"Gemini provided invalid citation URI: {uri!r}.")
+
+
+async def set_usage(
+    usage: GenAIUsageMetadata,
+    consumer: Consumer,
+    deployment: GeminiDeployment,
+    is_grounding_added: bool,
+) -> None:
+    if log.isEnabledFor(DEBUG):
+        log.debug(f"usage: {json_dumps(usage)}")
+
+    completion_tokens = usage.candidates_token_count or 0
+    completion_tokens += usage.thoughts_token_count or 0
+
+    if is_grounding_added:
+        completion_tokens += google_search_grounding_tokens(deployment)
+
+    prompt_tokens = usage.prompt_token_count or 0
+    prompt_tokens += usage.tool_use_prompt_token_count or 0
+
+    await consumer.set_usage(
+        TokenUsage(
+            prompt_tokens=prompt_tokens,
+            prompt_cached_tokens=usage.cached_content_token_count or 0,
+            completion_tokens=completion_tokens,
+            completion_reasoning_tokens=usage.thoughts_token_count or 0,
+        )
+    )
+
+
+async def create_function_calls_from_genai(
+    part: GenAIPart, consumer: Consumer, tools: ToolsConfig
+) -> None:
+    if not (function_call := part.function_call):
+        return
+    if not function_call.name:
+        return
+
+    function_args = (
+        json.dumps(function_call.args)
+        if function_call.args is not None
+        else None
+    )
+    if tools.is_tool:
+        await consumer.create_tool_call(
+            id=tools.create_fresh_tool_call_id(function_call.name),
+            name=function_call.name,
+            arguments=function_args,
+        )
+    else:
+        if consumer.has_function_call:
+            log.warning(
+                "The model generated more than one tool call. "
+                "Only the first one will be taken in to account."
+            )
+        else:
+            await consumer.create_function_call(
+                name=function_call.name,
+                arguments=function_args,
+            )
+
+
+async def create_image_attachment(
+    consumer: Consumer, storage: FileStorage | None, part: GenAIPart
+):
+    if (image := part.inline_data) and (data := image.data):
+        title = image.display_name or "Image"
+        type = image.mime_type or "image/png"
+        data_base64 = base64.b64encode(data).decode()
+
+        attachment = Attachment(title=title, type=type, data=data_base64)
+
+        if storage is not None:
+            filename = "images/" + compute_hash_digest(data)
+            meta = await storage.upload(
+                filename=filename,
+                content_type=type,
+                content=data,
+            )
+
+            attachment.data = None
+            attachment.url = meta["url"]
+
+        await consumer.add_attachment(attachment)

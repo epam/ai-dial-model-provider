@@ -1,0 +1,196 @@
+from typing import assert_never
+
+from aidial_adapter_anthropic.adapter import ChatCompletionAdapter
+from aidial_sdk.chat_completion.request import ChatCompletionRequest
+
+import aidial_model_provider.bedrock.llm.model.claude.adapter as anthropic_claude
+from aidial_model_provider.bedrock.bedrock import Bedrock
+from aidial_model_provider.bedrock.deployments import (
+    ChatCompletionDeployment as CCD,
+)
+from aidial_model_provider.bedrock.deployments import EmbeddingsDeployment as ED
+from aidial_model_provider.bedrock.embedding.amazon.titan_image import (
+    AmazonTitanImageEmbeddings,
+)
+from aidial_model_provider.bedrock.embedding.amazon.titan_text import (
+    AmazonTitanTextEmbeddings,
+)
+from aidial_model_provider.bedrock.embedding.cohere.embed_text import (
+    CohereTextEmbeddings,
+)
+from aidial_model_provider.bedrock.embedding.embeddings_adapter import (
+    EmbeddingsAdapter,
+)
+from aidial_model_provider.bedrock.llm.converse.configuration import (
+    has_converse_api_configuration,
+)
+from aidial_model_provider.bedrock.llm.converse.factory import (
+    ConverseAdapterFactory,
+    ToolsSupport,
+)
+from aidial_model_provider.bedrock.llm.converse.types import (
+    ConverseDocumentType,
+    ConverseImageType,
+)
+from aidial_model_provider.bedrock.llm.decorator.replicator import (
+    replicator_decorator,
+)
+from aidial_model_provider.bedrock.llm.model.stability.v2 import (
+    StabilityV2Adapter,
+)
+from aidial_model_provider.bedrock.upstream_config import UpstreamConfig
+from aidial_model_provider.bedrock.utils.adapter_deployments import (
+    AdapterChatCompletionDeployment,
+    AdapterEmbeddingsDeployment,
+)
+from aidial_model_provider.bedrock.utils.session_tags import (
+    resolve_session_tags,
+)
+
+
+async def get_bedrock_adapter(
+    *,
+    deployment: AdapterChatCompletionDeployment,
+    api_key: str,
+    upstream_config: UpstreamConfig,
+    request: ChatCompletionRequest | None,
+) -> ChatCompletionAdapter:
+    async def get_bedrock_client():
+        session_tags = await resolve_session_tags(
+            api_key, upstream_config, deployment.upstream_deployment_id
+        )
+        return await Bedrock.acreate(upstream_config, session_tags)
+
+    converse_adapter = ConverseAdapterFactory(
+        deployment=deployment, get_client=get_bedrock_client, api_key=api_key
+    )
+
+    match deployment.reference_deployment_id:
+        case (
+            CCD.ANTHROPIC_CLAUDE_V3_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V3_5_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V3_5_SONNET_V2
+            | CCD.ANTHROPIC_CLAUDE_V3_HAIKU
+            | CCD.ANTHROPIC_CLAUDE_V3_5_HAIKU
+            | CCD.ANTHROPIC_CLAUDE_V3_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V3_7_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V4_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V4_1_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V4_6_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V4_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V4_5_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V4_6_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V4_5_HAIKU
+            | CCD.ANTHROPIC_CLAUDE_V4_7_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V4_8_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V4_5_HAIKU_MANTLE
+            | CCD.ANTHROPIC_CLAUDE_V5_SONNET
+            | CCD.ANTHROPIC_CLAUDE_V5_OPUS
+            | CCD.ANTHROPIC_CLAUDE_V5_FABLE
+        ):
+            if has_converse_api_configuration(request, upstream_config):
+                return await converse_adapter.create(
+                    tools_support=ToolsSupport.ALWAYS,
+                    supported_image_types=ConverseImageType.all(),
+                    supported_document_types=ConverseDocumentType.all(),
+                )
+            else:
+                return await anthropic_claude.create_adapter(
+                    deployment.clone(deployment.reference_deployment_id),
+                    api_key,
+                    upstream_config,
+                )
+        case CCD.AI21_JAMBA_1_5_LARGE_V1 | CCD.AI21_JAMBA_1_5_MINI_V1:
+            return await converse_adapter.create(
+                tools_support=ToolsSupport.NON_STREAMING_ONLY,
+                supported_document_types=ConverseDocumentType.all(),
+            )
+        case (
+            CCD.STABILITY_STABLE_IMAGE_CORE_V1_1
+            | CCD.STABILITY_STABLE_IMAGE_ULTRA_V1
+            | CCD.STABILITY_STABLE_IMAGE_ULTRA_V1_1
+            | CCD.STABILITY_STABLE_DIFFUSION_3_5_LARGE_V1
+        ):
+            adapter = StabilityV2Adapter.create(
+                await get_bedrock_client(),
+                deployment.clone(deployment.reference_deployment_id),
+                api_key,
+            )
+            return replicator_decorator()(adapter)
+        case CCD.COHERE_COMMAND_R_V1 | CCD.COHERE_COMMAND_R_PLUS_V1:
+            return await converse_adapter.create(
+                tools_support=ToolsSupport.ALWAYS,
+                # Cohere models fail on missing tool description:
+                # > "validationException: Invalid parameter combination",
+                # even though other Converse models are fine with it.
+                ensure_non_empty_tool_descriptions=True,
+                supported_document_types=ConverseDocumentType.all(),
+            )
+        case (
+            CCD.AMAZON_NOVA_MICRO
+            | CCD.AMAZON_NOVA_PRO
+            | CCD.AMAZON_NOVA_LITE
+            | CCD.MINIMAX_M25
+        ):
+            return await converse_adapter.create(
+                tools_support=ToolsSupport.ALWAYS,
+                supported_image_types=ConverseImageType.all(),
+                supported_document_types=ConverseDocumentType.all(),
+            )
+        case CCD.META_LLAMA3_8B_INSTRUCT_V1 | CCD.META_LLAMA3_70B_INSTRUCT_V1:
+            return await converse_adapter.create(
+                supported_image_types=ConverseImageType.all(),
+            )
+        case (
+            CCD.META_LLAMA3_1_8B_INSTRUCT_V1
+            | CCD.META_LLAMA3_2_1B_INSTRUCT_V1
+            | CCD.META_LLAMA3_2_3B_INSTRUCT_V1
+            | CCD.DEEPSEEK_R1_V2
+        ):
+            return await converse_adapter.create()
+        case (
+            CCD.META_LLAMA3_1_70B_INSTRUCT_V1
+            | CCD.META_LLAMA3_1_405B_INSTRUCT_V1
+            | CCD.META_LLAMA3_3_70B_INSTRUCT_V1
+        ):
+            return await converse_adapter.create(
+                tools_support=ToolsSupport.NON_STREAMING_ONLY,
+            )
+        case (
+            CCD.META_LLAMA3_2_11B_INSTRUCT_V1
+            | CCD.META_LLAMA3_2_90B_INSTRUCT_V1
+            | CCD.META_LLAMA4_MAVERICK_17B_INSTRUCT_V1
+            | CCD.META_LLAMA4_SCOUT_17B_INSTRUCT_V1
+        ):
+            return await converse_adapter.create(
+                tools_support=ToolsSupport.NON_STREAMING_ONLY,
+                supported_image_types=ConverseImageType.all(),
+            )
+        case _:
+            assert_never(deployment.reference_deployment_id)
+
+
+async def get_embeddings_model(
+    *,
+    deployment: AdapterEmbeddingsDeployment,
+    api_key: str,
+    upstream_config: UpstreamConfig,
+) -> EmbeddingsAdapter:
+    model = deployment.upstream_deployment_id
+    session_tags = await resolve_session_tags(api_key, upstream_config, model)
+    client = await Bedrock.acreate(upstream_config, session_tags)
+    match deployment.reference_deployment_id:
+        case ED.AMAZON_TITAN_EMBED_TEXT_V1:
+            return AmazonTitanTextEmbeddings.create(
+                client, model, supports_dimensions=False
+            )
+        case ED.AMAZON_TITAN_EMBED_TEXT_V2:
+            return AmazonTitanTextEmbeddings.create(
+                client, model, supports_dimensions=True
+            )
+        case ED.AMAZON_TITAN_EMBED_IMAGE_V1:
+            return AmazonTitanImageEmbeddings.create(client, model, api_key)
+        case ED.COHERE_EMBED_ENGLISH_V3 | ED.COHERE_EMBED_MULTILINGUAL_V3:
+            return CohereTextEmbeddings.create(client, model)
+        case _:
+            assert_never(deployment)

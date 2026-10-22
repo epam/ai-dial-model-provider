@@ -1,0 +1,46 @@
+import json
+import logging
+from collections.abc import AsyncIterator, Mapping
+from typing import Any
+
+from aidial_model_provider.dial.utils.exceptions import (
+    to_dial_exception,
+    to_json_content,
+)
+
+DATA_PREFIX = "data: "
+OPENAI_END_MARKER = "[DONE]"
+
+
+def format_chunk(data: str | Mapping[str, Any]) -> str:
+    if isinstance(data, str):
+        return DATA_PREFIX + data.strip() + "\n\n"
+    else:
+        return DATA_PREFIX + json.dumps(data, separators=(",", ":")) + "\n\n"
+
+
+END_CHUNK = format_chunk(OPENAI_END_MARKER)
+
+
+log = logging.getLogger(__name__)
+
+
+async def to_openai_sse_stream(
+    stream: AsyncIterator[dict],
+) -> AsyncIterator[str]:
+    try:
+        async for chunk in stream:
+            yield format_chunk(chunk)
+    except Exception as e:
+        dial_exception = to_dial_exception(e)
+
+        log.exception(
+            f"Caught exception while streaming: {type(e).__module__}.{type(e).__name__}. "
+            f"The exception converted to the dial exception: {dial_exception!r}."
+        )
+
+        error_chunk = to_json_content(dial_exception)
+
+        yield format_chunk(error_chunk)
+
+    yield END_CHUNK

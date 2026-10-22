@@ -1,0 +1,1393 @@
+import json
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from typing import Unpack
+
+import openai
+import pytest
+from openai import AsyncAzureOpenAI, BadRequestError, UnprocessableEntityError
+
+from aidial_model_provider.bedrock.deployments import (
+    ChatCompletionDeployment as D,
+)
+from aidial_model_provider.bedrock.utils.region_deployment import (
+    RegionDeployment,
+)
+from tests.integration_tests.bedrock.constants import (
+    DOG_PICTURE,
+    DOG_PICTURE_CONTENT,
+    EXCEL_DOCUMENT_RESOURCE,
+    MARKDOWN_DOCUMENT_RESOURCE,
+    PDF_DOCUMENT_RESOURCE,
+)
+from tests.unit_tests.bedrock.test_configuration import (
+    deployments_supporting_optimized_latency,
+)
+from tests.utils.bedrock.exception import ExpectedException, expected_exception
+from tests.utils.bedrock.json import match_objects
+from tests.utils.bedrock.openai import (
+    GET_CURRENT_TIME_FUNCTION,
+    GET_WEATHER_FUNCTION,
+    ChatCompletionArgs,
+    ChatCompletionResult,
+    ai,
+    ai_tools,
+    chat_completion,
+    function_to_tool,
+    sanitize_test_name,
+    sys,
+    tool_request,
+    tool_response,
+    user,
+    user_with_attachment_data,
+    user_with_attachment_url,
+    user_with_file_content_part,
+    user_with_image_url,
+)
+from tests.utils.bedrock.selector import Pred, Selector, pred
+from tests.utils.bedrock.tools import ToolCallTest
+
+Deployment = RegionDeployment[D]
+
+_WEST = "us-west-2"
+_EAST_1 = "us-east-1"
+_EAST_2 = "us-east-2"
+_DEPLOYMENT_TO_REGION: Mapping[Deployment, str] = {
+    D.AI21_JAMBA_1_5_LARGE_V1: _EAST_1,
+    D.AI21_JAMBA_1_5_MINI_V1: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V3_SONNET.US: _WEST,
+    D.ANTHROPIC_CLAUDE_V3_5_SONNET.US: _WEST,
+    D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2.US: _WEST,
+    D.ANTHROPIC_CLAUDE_V3_5_HAIKU.US: _WEST,
+    D.ANTHROPIC_CLAUDE_V3_7_SONNET.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_SONNET.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_OPUS.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_1_OPUS.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_6_OPUS.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_5_SONNET.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_6_SONNET.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_5_HAIKU.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_5_HAIKU_MANTLE.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_7_OPUS.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V4_8_OPUS.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V5_SONNET.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V5_OPUS.US: _EAST_1,
+    D.ANTHROPIC_CLAUDE_V5_FABLE.US: _EAST_1,
+    D.META_LLAMA3_8B_INSTRUCT_V1: _WEST,
+    D.META_LLAMA3_70B_INSTRUCT_V1: _WEST,
+    D.META_LLAMA3_1_8B_INSTRUCT_V1: _WEST,
+    D.META_LLAMA3_1_70B_INSTRUCT_V1.US: _WEST,
+    D.META_LLAMA3_1_405B_INSTRUCT_V1.US: _EAST_2,
+    # Llama 3.2 1B is too unstable in responses for integration tests
+    # Sometimes it cannot calculate 2+2
+    # D.META_LLAMA3_2_1B_INSTRUCT_V1.US: _WEST_2,
+    D.META_LLAMA3_2_3B_INSTRUCT_V1.US: _WEST,
+    D.META_LLAMA3_2_11B_INSTRUCT_V1.US: _WEST,
+    D.META_LLAMA3_2_90B_INSTRUCT_V1.US: _WEST,
+    D.META_LLAMA3_3_70B_INSTRUCT_V1: _EAST_2,
+    D.META_LLAMA4_MAVERICK_17B_INSTRUCT_V1.US: _WEST,
+    D.META_LLAMA4_SCOUT_17B_INSTRUCT_V1.US: _WEST,
+    D.COHERE_COMMAND_R_V1: _WEST,
+    D.COHERE_COMMAND_R_PLUS_V1: _WEST,
+    D.AMAZON_NOVA_MICRO: _EAST_1,
+    D.AMAZON_NOVA_PRO.US: _EAST_1,
+    D.AMAZON_NOVA_LITE: _EAST_1,
+    D.DEEPSEEK_R1_V2.US: _EAST_1,
+    D.STABILITY_STABLE_IMAGE_ULTRA_V1: _WEST,
+    D.MINIMAX_M25: _EAST_1,
+}
+
+
+# https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards-anthropic.html
+def support_bedrock_runtime_claude_client(deployment: D) -> bool:
+    """
+    Models reachable through the bedrock-runtime data plane,
+    i.e. via the legacy (InvokeModel) and the Converse clients.
+    """
+    not_supported = {
+        # The Mantle-only deployment name isn't a valid bedrock-runtime model id
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU_MANTLE,
+        # Fable 5 rejects the `default` data retention mode, which only the
+        # Mantle endpoint is able to override:
+        # https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html
+        D.ANTHROPIC_CLAUDE_V5_FABLE,
+    }
+    return is_claude(deployment) and deployment not in not_supported
+
+
+def support_mantle_claude_client(deployment: D) -> bool:
+    return deployment in {
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU_MANTLE,
+        D.ANTHROPIC_CLAUDE_V4_7_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_8_OPUS,
+        D.ANTHROPIC_CLAUDE_V5_SONNET,
+        D.ANTHROPIC_CLAUDE_V5_OPUS,
+        D.ANTHROPIC_CLAUDE_V5_FABLE,
+    }
+
+
+def is_retired_model(deployment: D) -> bool:
+    # Keep at least one model on the list to test how the adapter handles retired models in streaming and non-streaming modes
+    # Retired models: https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle-legacy.html#versions-for-legacy-and-eol-legacy
+    return deployment in {
+        D.STABILITY_STABLE_IMAGE_ULTRA_V1,
+        D.ANTHROPIC_CLAUDE_V3_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2,
+        D.ANTHROPIC_CLAUDE_V3_7_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_OPUS,
+        D.COHERE_COMMAND_R_V1,
+        D.COHERE_COMMAND_R_PLUS_V1,
+        D.META_LLAMA3_1_405B_INSTRUCT_V1,
+        D.META_LLAMA3_2_3B_INSTRUCT_V1,
+        D.META_LLAMA3_2_11B_INSTRUCT_V1,
+        D.META_LLAMA3_2_90B_INSTRUCT_V1,
+    }
+
+
+def is_legacy_model(deployment: D) -> bool:
+    # Legacy but not yet completely retired models
+    # return 404 when are being unused for 30 days.
+    return deployment in {
+        D.AI21_JAMBA_1_5_LARGE_V1,
+        D.AI21_JAMBA_1_5_MINI_V1,
+    }
+
+
+def is_claude(deployment: D) -> bool:
+    return deployment in [
+        D.ANTHROPIC_CLAUDE_V3_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2,
+        D.ANTHROPIC_CLAUDE_V3_HAIKU,
+        D.ANTHROPIC_CLAUDE_V3_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V3_OPUS,
+        D.ANTHROPIC_CLAUDE_V3_7_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_1_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_6_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU_MANTLE,
+        D.ANTHROPIC_CLAUDE_V4_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_6_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_7_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_8_OPUS,
+        D.ANTHROPIC_CLAUDE_V5_SONNET,
+        D.ANTHROPIC_CLAUDE_V5_OPUS,
+        D.ANTHROPIC_CLAUDE_V5_FABLE,
+    ]
+
+
+def is_vision_model(deployment: D) -> bool:
+    return deployment in [
+        D.META_LLAMA3_2_11B_INSTRUCT_V1,
+        D.META_LLAMA3_2_90B_INSTRUCT_V1,
+        D.META_LLAMA4_MAVERICK_17B_INSTRUCT_V1,
+        D.META_LLAMA4_SCOUT_17B_INSTRUCT_V1,
+        D.AMAZON_NOVA_PRO,
+        D.AMAZON_NOVA_LITE,
+    ] or (
+        is_claude(deployment)
+        # Claude 3.5 Haiku was launched as a text-only model
+        # https://assets.anthropic.com/m/61e7d27f8c8f5919/original/Claude-3-Model-Card.pdf
+        and deployment != D.ANTHROPIC_CLAUDE_V3_5_HAIKU
+    )
+
+
+def select(p: Selector[D], xs: list[Deployment]) -> list[Deployment]:
+    ret = [x for x in xs if p(x.origin)]
+    assert ret, "The selected list of deployments is empty"
+    return ret
+
+
+all_deployments = list(_DEPLOYMENT_TO_REGION.keys())
+deployments = select(
+    ~pred(is_retired_model) & ~pred(is_legacy_model), all_deployments
+)
+retired_deployments = select(pred(is_retired_model), all_deployments)
+legacy_deployments = select(pred(is_legacy_model), all_deployments)
+vision_deployments = select(pred(is_vision_model), deployments)
+vision_deployments_not_llama3_2_90b = select(
+    lambda d: d.origin != D.META_LLAMA3_2_90B_INSTRUCT_V1, vision_deployments
+)
+
+
+def is_llama(deployment: D) -> bool:
+    return "meta.llama" in deployment.value
+
+
+def is_cohere_command_plus(deployment: D) -> bool:
+    return "cohere.command" in deployment.value
+
+
+def is_nova(deployment: D) -> bool:
+    return "amazon.nova" in deployment.value
+
+
+def is_minimax(deployment: D) -> bool:
+    return "minimax" in deployment.value
+
+
+def is_deepseek(deployment: D) -> bool:
+    return "deepseek" in deployment.value
+
+
+def is_ai21(deployment: D) -> bool:
+    return "ai21." in deployment.value
+
+
+def supports_tools(deployment: D) -> bool:
+    return is_claude(deployment) or deployment in [
+        # Llama models are supposed to support tools, but they are highly unstable
+        # D.META_LLAMA3_1_70B_INSTRUCT_V1,
+        # D.META_LLAMA3_1_405B_INSTRUCT_V1,
+        # D.META_LLAMA3_2_90B_INSTRUCT_V1,
+        # D.META_LLAMA3_3_70B_INSTRUCT_V1,
+        # D.META_LLAMA4_MAVERICK_17B_INSTRUCT_V1,
+        # D.META_LLAMA4_SCOUT_17B_INSTRUCT_V1,
+        # Technically, Nova Micro supports tools, but it's unstable
+        # D.AMAZON_NOVA_MICRO,
+        D.AMAZON_NOVA_PRO,
+        D.AMAZON_NOVA_LITE,
+        D.AMAZON_NOVA_MICRO,
+        D.MINIMAX_M25,
+        # DeepSeek via Converse API doesn't support tools even though
+        # tool support is claimed in the official documentation:
+        # https://api-docs.deepseek.com/guides/function_calling
+        # D.DEEPSEEK_R1_V2,
+        D.AI21_JAMBA_1_5_LARGE_V1,
+        # Mini is very bad with tools
+        # D.AI21_JAMBA_1_5_MINI_V1,
+        D.COHERE_COMMAND_R_V1,
+        D.COHERE_COMMAND_R_PLUS_V1,
+    ]
+
+
+def is_stable_with_vacuous_tool_definition(deployment: D) -> bool:
+    # Opus 5 is unstable when a tool declares no parameters or no description:
+    # it either invents a placeholder argument ({"___dummy": null}) or
+    # replies with a textual pseudo-call instead of a tool call.
+    return deployment != D.ANTHROPIC_CLAUDE_V5_OPUS
+
+
+_vacuous_tool_definition_deployments = select(
+    pred(supports_tools) & pred(is_stable_with_vacuous_tool_definition),
+    deployments,
+)
+
+
+def supports_forced_tool_choice(deployment: D) -> bool:
+    return supports_tools(deployment) and is_claude(deployment)
+
+
+def supports_parallel_tool_calls(deployment: D) -> bool:
+    return deployment not in [
+        D.ANTHROPIC_CLAUDE_V3_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2,
+        D.ANTHROPIC_CLAUDE_V3_7_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V4_5_SONNET,
+        D.META_LLAMA3_3_70B_INSTRUCT_V1,
+        D.AI21_JAMBA_1_5_MINI_V1,
+        D.AMAZON_NOVA_MICRO,
+    ] and supports_tools(deployment)
+
+
+def supports_document_understanding(deployment: D) -> bool:
+    return deployment in [
+        D.ANTHROPIC_CLAUDE_V3_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_7_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_6_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_7_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_8_OPUS,
+        D.ANTHROPIC_CLAUDE_V5_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V4_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_6_SONNET,
+        D.ANTHROPIC_CLAUDE_V5_SONNET,
+        D.ANTHROPIC_CLAUDE_V5_FABLE,
+    ]
+
+
+def supports_multi_modal_function_responses(deployment: D) -> bool:
+    return (
+        "claude" in deployment.value
+        and deployment != D.ANTHROPIC_CLAUDE_V3_5_HAIKU
+    )
+
+
+def supports_json_object_response_format(deployment: D) -> bool:
+    return deployment in [
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2,
+        D.ANTHROPIC_CLAUDE_V3_7_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_1_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_6_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_7_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_8_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V4_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_6_SONNET,
+    ]
+
+
+def supports_json_schema_response_format(deployment: D) -> bool:
+    return deployment in [
+        D.ANTHROPIC_CLAUDE_V4_5_HAIKU,
+        D.ANTHROPIC_CLAUDE_V4_6_OPUS,
+        D.ANTHROPIC_CLAUDE_V4_5_SONNET,
+        D.ANTHROPIC_CLAUDE_V4_6_SONNET,
+    ]
+
+
+def supports_stop_sequence(deployment: D) -> bool:
+    return not is_minimax(deployment)
+
+
+def is_claude_5(deployment: D) -> bool:
+    return deployment in [
+        D.ANTHROPIC_CLAUDE_V5_OPUS,
+        D.ANTHROPIC_CLAUDE_V5_SONNET,
+        D.ANTHROPIC_CLAUDE_V5_FABLE,
+    ]
+
+
+def is_reasoning_model(deployment: D) -> bool:
+    # The models with reasoning feature enabled by default
+    # and no way to disable it.
+    return (
+        is_deepseek(deployment)
+        or is_minimax(deployment)
+        or is_claude_5(deployment)
+    )
+
+
+@dataclass
+class DeploymentSpec:
+    region: str
+    deployment: Deployment
+    optimized_latency: bool
+    bedrock_client_type: str | None = None
+
+    def get_id(self):
+        ret = f"{display_deployment(self.deployment)}"
+        if self.optimized_latency:
+            ret += "-optimized"
+        if self.bedrock_client_type is not None:
+            ret += f"-{self.bedrock_client_type}_client"
+        return ret
+
+
+def _supported_claude_client_types(
+    deployment: Deployment, with_converse: bool
+) -> tuple[str, ...]:
+    ret = []
+    if support_bedrock_runtime_claude_client(deployment.origin):
+        ret.append("legacy")
+        if with_converse:
+            ret.append("converse")
+    if support_mantle_claude_client(deployment.origin):
+        ret.append("mantle")
+    return tuple(ret)
+
+
+def claude_client_type(deployment: Deployment) -> str | None:
+    """
+    The Claude client to pin for the tests that aren't parametrized
+    by the client. None for the non-Claude deployments.
+    """
+    client_types = _supported_claude_client_types(
+        deployment, with_converse=False
+    )
+    return client_types[0] if client_types else None
+
+
+def _deployment_specs(deployments: list[Deployment], with_converse: bool):
+    for deployment in deployments:
+        region = _DEPLOYMENT_TO_REGION.get(deployment)
+        if region is None:
+            raise ValueError(
+                f"{deployment.value!r} is missing from the region mapping"
+            )
+
+        opt_latency_regions = (
+            deployments_supporting_optimized_latency.get(deployment.origin)
+            or []
+        )
+
+        latencies = [False]
+        if region in opt_latency_regions:
+            latencies.append(True)
+
+        bedrock_client_types: tuple[str | None, ...] = (
+            _supported_claude_client_types(deployment, with_converse)
+            if is_claude(deployment.origin)
+            else (None,)
+        )
+
+        for latency in latencies:
+            for bedrock_client_type in bedrock_client_types:
+                yield DeploymentSpec(
+                    region=region,
+                    deployment=deployment,
+                    optimized_latency=latency,
+                    bedrock_client_type=bedrock_client_type,
+                )
+
+
+def _deployment_spec(
+    deployments: list[Deployment], with_converse: bool = False
+):
+    return pytest.mark.parametrize(
+        "deployment_spec",
+        list(_deployment_specs(deployments, with_converse)),
+        ids=lambda x: x.get_id(),
+    )
+
+
+@pytest.fixture
+def deployment(deployment_spec: DeploymentSpec) -> Deployment:
+    return deployment_spec.deployment
+
+
+@pytest.fixture
+def region(deployment_spec: DeploymentSpec) -> str:
+    return deployment_spec.region
+
+
+@pytest.fixture
+def optimized_latency(deployment_spec: DeploymentSpec) -> bool:
+    return deployment_spec.optimized_latency
+
+
+@pytest.fixture(params=[True, False], ids=["stream", "block"])
+def stream(request) -> bool:
+    return request.param
+
+
+@pytest.fixture(
+    params=[
+        user_with_attachment_data,
+        user_with_attachment_url,
+        user_with_image_url,
+    ],
+    ids=[
+        "attachment_data",
+        "attachment_data_url",
+        "content_part_image_url",
+    ],
+)
+def create_message_with_image(request) -> Callable:
+    return request.param
+
+
+@pytest.fixture
+def bedrock_client_type(deployment_spec: DeploymentSpec) -> str | None:
+    return deployment_spec.bedrock_client_type
+
+
+def _request_deployment_id(
+    deployment: Deployment, bedrock_client_type: str | None
+) -> str:
+    return (
+        deployment.origin.value
+        if bedrock_client_type == "mantle" and is_claude(deployment.origin)
+        else deployment.value
+    )
+
+
+@pytest.fixture
+def openai_client(
+    deployment: Deployment,
+    region: str,
+    get_openai_client,
+    bedrock_client_type: str | None,
+):
+    deployment_id = _request_deployment_id(deployment, bedrock_client_type)
+    extra_headers = (
+        {"claude_client": bedrock_client_type}
+        if bedrock_client_type is not None
+        else None
+    )
+    return get_openai_client(
+        deployment_id, region=region, extra_headers=extra_headers
+    )
+
+
+Chat = Callable[..., Awaitable[ChatCompletionResult]]
+
+
+@pytest.fixture
+def chat(
+    optimized_latency: bool, openai_client: AsyncAzureOpenAI, stream: bool
+):
+    async def _inner(
+        **kwargs: Unpack[ChatCompletionArgs],
+    ) -> ChatCompletionResult:
+        kwargs["configuration"] = kwargs.get("configuration") or {}
+        if optimized_latency:
+            kwargs["configuration"]["performanceConfig"] = {
+                "latency": "optimized"
+            }
+
+        return await chat_completion(openai_client, stream=stream, **kwargs)
+
+    return _inner
+
+
+def display_deployment(dep: Deployment):
+    return sanitize_test_name(dep.value)
+
+
+@_deployment_spec(retired_deployments)
+async def test_retired_models(chat: Chat):
+    async with expected_exception(
+        cls=openai.NotFoundError,
+        status_code=404,
+        message="This model version has reached the end of its life. Please refer to the AWS documentation for more details.",
+        display_message="This model version has reached the end of its life",
+    ):
+        await chat(messages=[user("test")], max_tokens=1)
+
+
+@_deployment_spec(legacy_deployments)
+async def test_legacy_models(chat: Chat):
+    async with expected_exception(
+        cls=openai.NotFoundError,
+        status_code=404,
+        message="This Model is marked by provider as Legacy and you have not been actively using the model in the last 30 days. Please upgrade to an active model on Amazon Bedrock",
+    ):
+        await chat(messages=[user("test")], max_tokens=1)
+
+
+@_deployment_spec(deployments)
+async def test_dialog_recall(deployment: Deployment, chat: Chat):
+    response = await chat(
+        messages=[
+            user("Remember Paris city. Just say hello"),
+            ai("Hello"),
+            user("What city did I mention earlier?"),
+        ],
+        # It could take hundreds of tokens for a reasoning model
+        # to come up with an answer to a simple question like this.
+        max_tokens=32 if not is_reasoning_model(deployment.origin) else 512,
+    )
+    assert "paris" in response.content.lower()
+
+
+@_deployment_spec(deployments)
+async def test_model_field(
+    deployment: Deployment, bedrock_client_type: str | None, chat: Chat
+):
+    response = await chat(messages=[user("test")], max_tokens=1)
+    assert (
+        _request_deployment_id(deployment, bedrock_client_type)
+        == response.response.model
+    )
+
+
+@_deployment_spec(deployments, with_converse=True)
+async def test_2_plus_3(chat: Chat):
+    response = await chat(messages=[user("compute (2+3)")])
+    assert "5" in response.content
+
+
+@_deployment_spec(deployments)
+async def test_text_content_parts_in_assistant_message(
+    deployment: D, chat: Chat
+):
+    response = await chat(
+        messages=[
+            user("compute (2+3) and (5+8)"),
+            ai(
+                [
+                    {"type": "text", "text": "5"},
+                    {"type": "text", "text": "13"},
+                ]
+            ),
+            user("compute (11+22). Reply with a single number."),
+        ],
+        max_tokens=10 if not is_reasoning_model(deployment.origin) else 512,
+    )
+    assert "33" in response.content
+
+
+@_deployment_spec(deployments)
+async def test_empty_system_message(chat: Chat):
+    response = await chat(messages=[sys(""), user("compute (2+4)")])
+    assert "6" in response.content
+
+
+@_deployment_spec(deployments)
+async def test_multiple_candidates(deployment: Deployment, chat: Chat):
+    response = await chat(
+        # It could take hundreds of tokens for a reasoning model
+        # to come up with an answer to a simple question like this.
+        max_tokens=10 if not is_reasoning_model(deployment.origin) else 1024,
+        n=5,
+        messages=[user("2+7=?. Reply with a single number")],
+    )
+    assert len(response.contents) == 5
+    for content in response.contents:
+        assert "9" in content
+
+
+@_deployment_spec(deployments)
+async def test_hello(chat: Chat):
+    query = 'Reply with "Hello"'
+    response = await chat(messages=[user(query)])
+    content = response.content.lower()
+    assert "hello" in content or "hi" in content
+
+
+@_deployment_spec(deployments)
+async def test_empty_dialog(chat: Chat):
+    async with expected_exception(
+        status_code=422,
+        cls=UnprocessableEntityError,
+        message="List of messages must not be empty",
+    ):
+        await chat(max_tokens=1, messages=[])
+
+
+@_deployment_spec(deployments)
+@pytest.mark.parametrize("is_empty", [True, False], ids=["empty", "non-empty"])
+async def test_empty_user_message(
+    deployment: Deployment,
+    optimized_latency: bool,
+    stream: bool,
+    is_empty: bool,
+    chat: Chat,
+):
+    origin = deployment.origin
+
+    if is_ai21(origin) and stream and not is_empty:
+        pytest.skip("A21 hangs indefinitely on this input")
+
+    converse_api_error_message = "The text field in the ContentBlock object at messages.0.content.0 is blank. Add text to the text field, and try again."
+
+    if is_claude(origin):
+        if (
+            origin == D.ANTHROPIC_CLAUDE_V3_5_HAIKU
+            and is_empty
+            and optimized_latency
+        ):
+            message = converse_api_error_message
+        else:
+            message = (
+                "messages: text content blocks must contain non-whitespace text"
+            )
+    elif is_ai21(origin):
+        if is_empty:
+            message = converse_api_error_message
+        else:
+            message = "Value error, message content must not be an empty string"
+    elif is_empty and (
+        is_cohere_command_plus(origin)
+        or is_llama(origin)
+        or is_nova(origin)
+        or is_deepseek(origin)
+        or is_minimax(origin)
+    ):
+        message = converse_api_error_message
+    else:
+        message = None
+
+    async def _run():
+        await chat(max_tokens=1, messages=[user("" if is_empty else " ")])
+
+    if message is not None:
+        async with expected_exception(
+            status_code=400, cls=BadRequestError, message=message
+        ):
+            await _run()
+    else:
+        await _run()
+
+
+@_deployment_spec(vision_deployments)
+async def test_vision_single_turn_with_text_part(
+    deployment: D, chat: Chat, create_message_with_image
+):
+    messages = [create_message_with_image("describe the image", DOG_PICTURE)]
+    await _run_test_vision(deployment, chat, messages, DOG_PICTURE_CONTENT)
+
+
+@_deployment_spec(vision_deployments_not_llama3_2_90b)
+async def test_vision_single_turn_with_empty_text_part(
+    deployment: D, chat: Chat, create_message_with_image
+):
+    messages = [create_message_with_image("", DOG_PICTURE)]
+    await _run_test_vision(deployment, chat, messages, DOG_PICTURE_CONTENT)
+
+
+@_deployment_spec(vision_deployments_not_llama3_2_90b)
+async def test_vision_single_turn_without_text_part(deployment: D, chat: Chat):
+    messages = [user_with_image_url(None, DOG_PICTURE)]
+    await _run_test_vision(deployment, chat, messages, DOG_PICTURE_CONTENT)
+
+
+@_deployment_spec(vision_deployments_not_llama3_2_90b)
+async def test_vision_two_turns(
+    deployment: D, chat: Chat, create_message_with_image
+):
+    user_message = create_message_with_image("", DOG_PICTURE)
+    messages = [
+        sys("describe an image when you receive it"),
+        user("2+3=?"),
+        ai("5"),
+        user_message,
+    ]
+    await _run_test_vision(deployment, chat, messages, DOG_PICTURE_CONTENT)
+
+
+@_deployment_spec(vision_deployments_not_llama3_2_90b)
+async def test_vision_single_turn_with_system(
+    deployment: D, chat: Chat, create_message_with_image
+):
+    user_message = create_message_with_image(None, DOG_PICTURE)
+    messages = [sys("describe the image"), user_message]
+    await _run_test_vision(deployment, chat, messages, DOG_PICTURE_CONTENT)
+
+
+async def _run_test_vision(
+    deployment: Deployment,
+    chat: Chat,
+    messages,
+    expected: str | list[str] | ExpectedException,
+):
+    async def _run():
+        max_tokens = 100 if not is_reasoning_model(deployment.origin) else 1024
+        return await chat(messages=messages, max_tokens=max_tokens)
+
+    if isinstance(expected, ExpectedException):
+        async with expected_exception(expected):
+            await _run()
+    else:
+        response = await _run()
+        substrings = [expected] if isinstance(expected, str) else expected
+        assert any(s in response.content.lower() for s in substrings)
+
+
+@_deployment_spec(deployments)
+async def test_finish_reason_length(chat: Chat):
+    response = await chat(
+        max_tokens=1,
+        messages=[user("tell me the full story of Pinocchio")],
+    )
+    assert len(response.content.split()) <= 1
+    assert response.usage is not None
+    assert response.usage.completion_tokens == 1
+    assert response.finish_reasons == ["length"]
+
+
+@_deployment_spec(select(pred(supports_stop_sequence), deployments))
+async def test_stop_sequence(chat: Chat):
+    stop = ["cat", "dog", "fish"]
+    response = await chat(
+        stop=stop,
+        messages=[user('Reply with "cat dog fish"')],
+    )
+    content = response.content.lower()
+    assert not all(w in content for w in stop)
+
+
+@_deployment_spec(select(pred(is_llama), deployments))
+async def test_llama_out_of_turn_dialog(chat: Chat):
+    async with expected_exception(
+        cls=BadRequestError,
+        message="A conversation must start with a user message",
+        status_code=400,
+    ):
+        await chat(
+            messages=[ai("hello"), user("what's 7+5?")],
+        )
+
+
+@_deployment_spec(select(pred(is_llama), deployments))
+async def test_llama_many_system_messages(chat: Chat):
+    response = await chat(
+        messages=[
+            sys("act as a helpful assistant"),
+            sys("act as a calculator"),
+            user("2+5=?"),
+        ],
+    )
+    assert "7" in response.content
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+async def test_tool_choice_none(
+    deployment: D, optimized_latency: bool, chat: Chat
+):
+    # The Anthropic API supports `tool_choice: none`, the Converse API doesn't.
+    if is_claude(deployment.origin) and not optimized_latency:
+        exc = None
+    else:
+        exc = ExpectedException(
+            type=UnprocessableEntityError,
+            message="tool_choice=none isn't supported by Converse API",
+            status_code=422,
+        )
+
+    async def _run():
+        return await chat(
+            messages=[
+                user("What's the weather in Glasgow?"),
+                ai_tools(
+                    [
+                        tool_request(
+                            "tool_1",
+                            "get_weather",
+                            {"location": "Glasgow", "unit": "celsius"},
+                        )
+                    ]
+                ),
+                tool_response("tool_1", "20 degrees"),
+                ai("It's 20 degrees"),
+                user("2+2=?"),
+            ],
+            tools=[function_to_tool(GET_WEATHER_FUNCTION)],
+            tool_choice="none",
+        )
+
+    if exc:
+        async with expected_exception(exc):
+            await _run()
+    else:
+        response = await _run()
+        assert "4" in response.content
+
+
+@_deployment_spec(_vacuous_tool_definition_deployments)
+async def test_tool_call_zero_parameters(chat: Chat):
+    response = await chat(
+        messages=[user("What time is it?")],
+        tools=[
+            function_to_tool(
+                {
+                    "name": "get_current_time",
+                    "description": "return the current time",
+                }
+            )
+        ],
+    )
+
+    tool_calls = response.tool_calls
+    assert tool_calls is not None, "Tool calls are missing"
+    assert tool_calls[0].type == "function"
+    function = tool_calls[0].function
+    assert function.name == "get_current_time"
+    assert function.arguments == "{}"
+    assert response.finish_reasons == ["tool_calls"]
+
+
+@_deployment_spec(select(pred(supports_forced_tool_choice), deployments))
+async def test_forced_tool_choice(chat: Chat):
+    func_name = GET_WEATHER_FUNCTION["name"]
+
+    response = await chat(
+        messages=[user("Glasgow is a city in Scotland. What's 2+2?")],
+        tools=[function_to_tool(GET_WEATHER_FUNCTION)],
+        tool_choice={
+            "type": "function",
+            "function": {"name": func_name},
+        },
+    )
+
+    tool_calls = response.tool_calls
+    assert tool_calls is not None, "Tool calls are missing"
+    assert len(tool_calls) == 1
+
+    function = tool_calls[0].function
+    assert function.name == func_name
+
+    match_objects(
+        {
+            "location": lambda s: "Glasgow" in s,
+            "unit": "celsius",
+        },
+        json.loads(function.arguments),
+    )
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+async def test_tool_calls_without_tool_definitions(
+    deployment: D, optimized_latency: bool, chat: Chat
+):
+    origin = deployment.origin
+    if origin == D.ANTHROPIC_CLAUDE_V3_SONNET:
+        exc = ExpectedException(
+            type=BadRequestError,
+            message="Requests which include `tool_use` or `tool_result` blocks must define tools.",
+            status_code=400,
+        )
+    elif is_claude(origin) and not optimized_latency:
+        exc = None
+    else:
+        # All Converse API based models fail with the validation error
+        exc = ExpectedException(
+            type=BadRequestError,
+            message="The toolConfig field must be defined when using toolUse and toolResult content blocks",
+            status_code=400,
+        )
+
+    async def _run():
+        return await chat(
+            messages=[
+                user("what time is it?"),
+                ai_tools(
+                    [
+                        {
+                            "type": "function",
+                            "id": "tool-call-id1",
+                            "function": {
+                                "name": "get_current_time",
+                                "arguments": "{}",
+                            },
+                        }
+                    ]
+                ),
+                tool_response(id="tool-call-id1", content="01:22 AM"),
+                ai("It's 01:22 AM"),
+                user("Now compute (2+3). Reply with a single digit"),
+            ],
+        )
+
+    if exc:
+        async with expected_exception(exc):
+            await _run()
+    else:
+        response = await _run()
+        assert "5" in response.content
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+@pytest.mark.parametrize(
+    "test", [ToolCallTest(1), ToolCallTest(2)], ids=lambda x: x.get_id()
+)
+async def test_function_call(
+    deployment: Deployment, test: ToolCallTest, chat: Chat
+):
+    origin = deployment.origin
+
+    response = await chat(
+        messages=test.messages(not is_llama(origin)),
+        functions=test.functions,
+    )
+
+    function_call = response.function_call
+    assert function_call is not None
+    assert function_call.name == test.function_name
+
+    function_args = json.loads(function_call.arguments)
+    assert match_objects(test.expected_function_args(0), function_args)
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+@pytest.mark.parametrize("test", [ToolCallTest(1)], ids=lambda x: x.get_id())
+async def test_function_response(
+    deployment: Deployment, test: ToolCallTest, chat: Chat
+):
+    origin = deployment.origin
+    messages = [
+        *test.messages(not is_llama(origin)),
+        test.function_request(0),
+        test.function_response(0),
+    ]
+
+    response = await chat(messages=messages, functions=test.functions)
+
+    assert str(test.city_temps[0]) in response.content
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+@pytest.mark.parametrize(
+    "test", [ToolCallTest(1), ToolCallTest(2)], ids=lambda x: x.get_id()
+)
+async def test_tool_call_basic(
+    deployment: Deployment, test: ToolCallTest, chat: Chat
+):
+    origin = deployment.origin
+
+    response = await chat(
+        messages=test.messages(not is_llama(origin)),
+        tools=test.tools,
+    )
+
+    tool_calls = response.tool_calls
+    assert tool_calls is not None, "Tool calls are missing"
+
+    expected_calls = test.targets if supports_parallel_tool_calls(origin) else 1
+
+    assert len(tool_calls) >= expected_calls, (
+        f"Number of tools calls: actual ({len(tool_calls)}), expected ({expected_calls})"
+    )
+
+    for idx, tool_call in enumerate(tool_calls):
+        function_call = tool_call.function
+        assert function_call.name == test.function_name
+
+        function_args = json.loads(function_call.arguments)
+        assert match_objects(test.expected_function_args(idx), function_args)
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+@pytest.mark.parametrize(
+    "test", [ToolCallTest(1), ToolCallTest(2)], ids=lambda x: x.get_id()
+)
+async def test_tool_response(
+    deployment: Deployment, test: ToolCallTest, chat: Chat
+):
+    origin = deployment.origin
+
+    messages = [
+        *test.messages(not is_llama(origin)),
+        test.tool_request(),
+        *test.tool_responses(),
+    ]
+
+    response = await chat(messages=messages, tools=test.tools)
+
+    for temp in test.city_temps:
+        assert str(temp) in response.content
+
+
+@_deployment_spec(select(pred(supports_tools), deployments))
+@pytest.mark.parametrize("test", [ToolCallTest(1)], ids=lambda x: x.get_id())
+@pytest.mark.parametrize("stream", [True], ids=["stream"])
+@pytest.mark.parametrize("optimized_latency", [False], ids=["std"])
+async def test_tool_call_with_empty_message(
+    deployment: Deployment, test: ToolCallTest, chat: Chat
+):
+    origin = deployment.origin
+
+    messages = [
+        *test.messages(not is_llama(origin)),
+        test.tool_request(content=""),
+        *test.tool_responses(),
+    ]
+
+    response = await chat(messages=messages, tools=test.tools)
+
+    for temp in test.city_temps:
+        assert str(temp) in response.content
+
+
+@_deployment_spec(_vacuous_tool_definition_deployments)
+@pytest.mark.parametrize("stream", [True], ids=["stream"])
+@pytest.mark.parametrize("optimized_latency", [False], ids=["std"])
+@pytest.mark.parametrize(
+    "description", ["", " \n\t", None], ids=["empty", "whitespace", "missing"]
+)
+async def test_tool_call_with_vacuous_description(
+    description: str | None, chat: Chat
+):
+    func_def = GET_CURRENT_TIME_FUNCTION.copy()
+    if description is None:
+        func_def.pop("description")
+    else:
+        func_def["description"] = description
+
+    response = await chat(
+        messages=[user("what time is it?")],
+        tools=[function_to_tool(func_def)],
+    )
+    assert response.finish_reasons == ["tool_calls"]
+    assert response.tool_calls is not None, "Tool calls are missing"
+    assert response.tool_calls[0].function.name == "get_current_time"
+
+
+class TestDocumentUnderstanding:
+    @pytest.fixture
+    def query(self) -> str:
+        return (
+            "Which novel the first page of the attached document quotes from? "
+            "Which animal is depicted on the second page?"
+        )
+
+    @staticmethod
+    async def _check_response(
+        *,
+        response: Awaitable[ChatCompletionResult],
+        deployment: D,
+        optimized_latency: bool,
+    ):
+        if (
+            not optimized_latency
+            and deployment.origin == D.ANTHROPIC_CLAUDE_V3_5_HAIKU
+        ):
+            # For some reason Claude 3.5 Haiku via Bedrock API doesn't support PDF,
+            # but via Converse API - it does.
+            async with expected_exception(
+                cls=openai.BadRequestError,
+                status_code=400,
+                message="'claude-3-5-haiku-20241022' does not support PDF input.",
+            ):
+                await response
+        else:
+            content = (await response).content.lower()
+
+            if optimized_latency:
+                # ConverseAPI isn't able to parse images unless citations are enabled
+                # which is currently not enabled automatically.
+                words = ["christmas", "carol"]
+            else:
+                words = ["christmas", "carol", "cat"]
+
+            for w in words:
+                assert w in content
+
+    @staticmethod
+    def _deployments(predicate: Pred[D]):
+        return _deployment_spec(select(predicate, deployments))
+
+    @_deployments(pred(supports_document_understanding))
+    async def test_document_in_attachments(
+        self, chat: Chat, query: str, optimized_latency: bool, deployment: D
+    ):
+        response = chat(
+            messages=[user_with_attachment_url(query, PDF_DOCUMENT_RESOURCE)]
+        )
+        await self._check_response(
+            response=response,
+            optimized_latency=optimized_latency,
+            deployment=deployment,
+        )
+
+    @_deployments(pred(supports_document_understanding))
+    async def test_document_in_content_part(
+        self, chat: Chat, query: str, optimized_latency: bool, deployment: D
+    ):
+        response = chat(
+            messages=[
+                user_with_file_content_part(
+                    query, "document.pdf", PDF_DOCUMENT_RESOURCE
+                )
+            ]
+        )
+        await self._check_response(
+            response=response,
+            optimized_latency=optimized_latency,
+            deployment=deployment,
+        )
+
+    @_deployments(
+        pred(supports_document_understanding)
+        & pred(supports_multi_modal_function_responses)
+    )
+    async def test_document_in_tool_result(
+        self, chat: Chat, query: str, optimized_latency: bool, deployment: D
+    ):
+        response = chat(
+            messages=[
+                user(query),
+                ai_tools(
+                    [tool_request(id="call-id", name="get_document", args={})]
+                ),
+                tool_response(
+                    id="call-id",
+                    content="here is the document",
+                    resources=[PDF_DOCUMENT_RESOURCE],
+                ),
+            ],
+            tools=[
+                function_to_tool({"name": "get_document", "parameters": {}})
+            ],
+        )
+        await self._check_response(
+            response=response,
+            optimized_latency=optimized_latency,
+            deployment=deployment,
+        )
+
+    @_deployments(pred(supports_document_understanding))
+    @pytest.mark.parametrize("stream", [False], ids=["block"])
+    async def test_excel_document(self, optimized_latency: bool, chat: Chat):
+        async def _run():
+            return await chat(
+                messages=[
+                    user_with_attachment_url(
+                        "how many cells there are in the given spreadsheet excluding headers?",
+                        EXCEL_DOCUMENT_RESOURCE,
+                    ),
+                ],
+            )
+
+        if optimized_latency:
+            # Converse API supports Excel documents, whereas Anthropic API - doesn't
+            response = await _run()
+            assert "6" in response.content.lower()
+        else:
+            error_message = "Unsupported media type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            async with expected_exception(
+                cls=openai.UnprocessableEntityError,
+                status_code=422,
+                message=error_message,
+                display_message=error_message,
+            ):
+                await _run()
+
+    @_deployments(pred(supports_document_understanding))
+    @pytest.mark.parametrize("stream", [False], ids=["block"])
+    async def test_markdown_document(self, chat: Chat):
+        response = await chat(
+            messages=[
+                user_with_attachment_url(
+                    "what does the Markdown document say?",
+                    MARKDOWN_DOCUMENT_RESOURCE,
+                ),
+            ],
+        )
+
+        assert "hello" in response.content.lower()
+
+
+@_deployment_spec(deployments)
+async def test_max_prompt_tokens(chat: Chat):
+    response = await chat(
+        max_tokens=1,
+        messages=[user("test")],
+        extra_body={"max_prompt_tokens": 200},
+    )
+    statistics = response.response.model_dump().get("statistics", {})
+    assert statistics.get("discarded_messages") == []
+
+
+@_deployment_spec([D.META_LLAMA3_8B_INSTRUCT_V1])
+async def test_allow_stream_options(chat: Chat):
+    response = await chat(
+        messages=[{"role": "user", "content": "2+2=?"}],
+        extra_body={"stream_options": {"include_usage": True}},
+    )
+    assert "4" in response.content
+
+
+@_deployment_spec([D.META_LLAMA3_8B_INSTRUCT_V1])
+async def test_reject_extra_top_level_fields(chat: Chat):
+    async with expected_exception(
+        cls=openai.BadRequestError,
+        status_code=400,
+        message="Your request contained invalid structure on path extra-top-field. Extra inputs are not permitted",
+    ):
+        await chat(
+            messages=[{"role": "user", "content": "2+2=?"}],
+            max_tokens=1,
+            extra_body={"extra-top-field": "extra-top-value"},
+        )
+
+
+@_deployment_spec([D.META_LLAMA3_8B_INSTRUCT_V1])
+async def test_reject_extra_message_fields(chat: Chat):
+    async with expected_exception(
+        cls=openai.BadRequestError,
+        status_code=400,
+        message="Your request contained invalid structure on path messages.0.extra-message-field. Extra inputs are not permitted",
+    ):
+        extra_message = {"extra-message-field": "extra-message-value"}
+        messages = [{"role": "user", "content": "2+2=?", **extra_message}]
+        await chat(messages=messages, max_tokens=1)  # type: ignore
+
+
+async def test_compatible_deployment_id(get_openai_client, stream: bool):
+    deployment = D.ANTHROPIC_CLAUDE_V3_5_SONNET_V2.US
+    openai_client = get_openai_client(
+        "xxx",
+        extra_headers={
+            "compatible_model_id": deployment.value,
+            "claude_client": "legacy",
+        },
+    )
+
+    msg = "The provided model identifier is invalid."
+    with pytest.raises(openai.BadRequestError, match=msg):
+        await chat_completion(
+            openai_client, stream=stream, messages=[user("test")]
+        )
+
+
+async def test_unknown_deployment_id(get_openai_client, stream: bool):
+    openai_client = get_openai_client("xxx")
+
+    with pytest.raises(openai.NotFoundError, match="Deployment not found"):
+        await chat_completion(
+            openai_client, stream=stream, messages=[user("test")]
+        )
+
+
+@_deployment_spec(
+    select(pred(supports_json_object_response_format), deployments)
+)
+async def test_json_object_response_format(chat: Chat):
+    response = await chat(
+        messages=[user("extract name and surname from 'John Doe'")],
+        response_format={"type": "json_object"},
+    )
+    assert response is not None
+
+
+@_deployment_spec(
+    select(pred(supports_json_schema_response_format), deployments)
+)
+async def test_json_schema_response_format(chat: Chat):
+    response = await chat(
+        messages=[user("extract name and surname from 'John Doe'")],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "PersonInfo",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "NameField": {"type": "string"},
+                        "SurnameField": {"type": "string"},
+                    },
+                    "required": ["NameField", "SurnameField"],
+                },
+            },
+        },
+    )
+    assert json.loads(response.content) == {
+        "NameField": "John",
+        "SurnameField": "Doe",
+    }
+
+
+@_deployment_spec(
+    select(pred(supports_json_schema_response_format), deployments)
+)
+async def test_json_schema_nested_objects_response_format(chat: Chat):
+    response = await chat(
+        messages=[user("extract name and surname from 'John Doe'")],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "PersonInfo",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "NameField": {
+                            "type": "object",
+                            "properties": {"Value": {"type": "string"}},
+                        },
+                        "SurnameField": {"type": "string"},
+                    },
+                    "required": ["NameField", "SurnameField"],
+                },
+            },
+        },
+    )
+    assert json.loads(response.content) == {
+        "NameField": {"Value": "John"},
+        "SurnameField": "Doe",
+    }

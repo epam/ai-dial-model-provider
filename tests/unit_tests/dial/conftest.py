@@ -1,0 +1,19 @@
+import os
+
+import httpx
+import pytest_asyncio
+
+
+def pytest_configure():
+    os.environ["DIAL_URL"] = "dummy"
+
+
+@pytest_asyncio.fixture
+async def test_app():
+    from aidial_model_provider.dial.app import app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app),
+        base_url="http://test-app.com",
+    ) as client:
+        yield client

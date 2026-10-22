@@ -1,0 +1,232 @@
+import os
+import re
+from datetime import datetime
+from typing import Any, ClassVar, Optional, TypedDict, assert_never
+
+import fastapi
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
+
+from aidial_model_provider.bedrock.utils.boto import close_client, create_client
+from aidial_model_provider.bedrock.utils.cache import cache
+from aidial_model_provider.bedrock.utils.concurrency import run_in_threadpool
+from aidial_model_provider.bedrock.utils.env import (
+    AWSClaudeClient,
+    get_aws_default_region,
+    get_default_claude_client,
+)
+from aidial_model_provider.utils.log_config import logger as log
+
+_UPSTREAM_CONFIG_HEADER_NAME = "x-upstream-extra-data"
+
+_DEFAULT_ROLE_SESSION_NAME = "BedrockAccessSession"
+
+# The value source of the session tag naming the user project. When such a
+# tag is passed, the project names the role session instead of the default
+# above.
+_PROJECT_VALUE_SOURCE = "UserInfo.project"
+# The marker goes in front, so that it survives the truncation of a long
+# project and groups the adapter sessions together in the AWS logs.
+_PROJECT_ROLE_SESSION_NAME_PREFIX = "Project_"
+
+# AWS STS RoleSessionName constraints:
+# https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html
+_MAX_ROLE_SESSION_NAME_LEN = 64
+_INVALID_ROLE_SESSION_NAME_CHARS = re.compile(r"[^\w+=,.@-]")
+
+
+class SessionTag(TypedDict):
+    Key: str
+    ValueSource: str
+    Value: str
+
+
+def _get_role_session_name(session_tags: list[SessionTag] | None) -> str:
+    project = next(
+        (
+            tag["Value"]
+            for tag in session_tags or []
+            if tag["ValueSource"] == _PROJECT_VALUE_SOURCE
+        ),
+        None,
+    )
+
+    # A user without a project is resolved to the JSON "null" by the session
+    # tags, which makes for a meaningless session name.
+    if project is None or project in {"", "null"}:
+        return _DEFAULT_ROLE_SESSION_NAME
+
+    project = f"{_PROJECT_ROLE_SESSION_NAME_PREFIX}{project}"
+    project = _INVALID_ROLE_SESSION_NAME_CHARS.sub("_", project)
+    return project[:_MAX_ROLE_SESSION_NAME_LEN]
+
+
+class ClientCredentialArgs(BaseModel):
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_session_token: str | None = None
+
+
+class AWSClientCredentials(BaseModel):
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str | None = None
+
+    def get_credentials(self) -> tuple[datetime | None, ClientCredentialArgs]:
+        return None, ClientCredentialArgs(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+
+
+@cache(close=close_client)
+def get_sts_client(region: str) -> Any:
+    return create_client("sts", region_name=region)
+
+
+class AWSAssumeRoleCredentials(BaseModel):
+    aws_assume_role_arn: str
+
+    async def get_credentials(
+        self,
+        region: str,
+        session_tags: list[SessionTag] | None = None,
+    ) -> tuple[datetime, ClientCredentialArgs]:
+        assume_role_params: dict = {
+            "RoleArn": self.aws_assume_role_arn,
+            "RoleSessionName": _get_role_session_name(session_tags),
+        }
+        if session_tags:
+            assume_role_params["Tags"] = [
+                {"Key": tag["Key"], "Value": tag["Value"]}
+                for tag in session_tags
+            ]
+
+        response = await run_in_threadpool(
+            lambda: get_sts_client(region).assume_role(**assume_role_params)
+        )
+
+        creds = response["Credentials"]
+
+        return creds["Expiration"], ClientCredentialArgs(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+
+
+class CloudUpstreamConfig(BaseModel):
+    region: str
+    credentials: AWSClientCredentials | AWSAssumeRoleCredentials | None = None
+    claude_client: AWSClaudeClient
+
+    @classmethod
+    async def from_request(
+        cls, request: fastapi.Request
+    ) -> "CloudUpstreamConfig":
+        conf = request.headers.get(_UPSTREAM_CONFIG_HEADER_NAME)
+        upstream_config = (
+            UpstreamConfigData.model_validate_json(conf)
+            if conf
+            else UpstreamConfigData()
+        )
+
+        return cls(
+            region=upstream_config.region,
+            credentials=upstream_config._get_client_credentials(),
+            claude_client=upstream_config.claude_client,
+        )
+
+    async def get_credentials(
+        self, session_tags: list[SessionTag] | None
+    ) -> tuple[datetime | None, ClientCredentialArgs]:
+        match self.credentials:
+            case None:
+                return None, ClientCredentialArgs()
+            case AWSClientCredentials():
+                return self.credentials.get_credentials()
+            case AWSAssumeRoleCredentials():
+                return await self.credentials.get_credentials(
+                    self.region, session_tags
+                )
+            case _:
+                assert_never(self.credentials)
+
+
+class ApiKeyUpstreamConfig(BaseModel):
+    _UPSTREAM_API_KEY_HEADER_NAME: ClassVar[str] = "x-upstream-key"
+
+    api_key: str
+
+    @classmethod
+    def from_request(
+        cls, request: fastapi.Request
+    ) -> Optional["ApiKeyUpstreamConfig"]:
+        key = request.headers.get(cls._UPSTREAM_API_KEY_HEADER_NAME)
+        return None if key is None else cls(api_key=key)
+
+
+UpstreamConfig = ApiKeyUpstreamConfig | CloudUpstreamConfig
+
+
+async def parse_upstream_config(request: fastapi.Request) -> UpstreamConfig:
+    if (conf := ApiKeyUpstreamConfig.from_request(request)) is not None:
+        log.debug("accessing deployment via platform api-key")
+        return conf
+
+    log.debug("accessing deployment via cloud creds")
+    return await CloudUpstreamConfig.from_request(request)
+
+
+class UpstreamConfigData(BaseModel):
+    region: str = Field(default_factory=get_aws_default_region)
+    claude_client: AWSClaudeClient = Field(
+        default_factory=get_default_claude_client
+    )
+    aws_access_key_id: str | None = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_session_token: str | None = os.getenv("AWS_SESSION_TOKEN")
+    aws_assume_role_arn: str | None = os.getenv("AWS_ASSUME_ROLE_ARN")
+
+    def _get_client_credentials(
+        self,
+    ) -> AWSClientCredentials | AWSAssumeRoleCredentials | None:
+        if self.aws_access_key_id and self.aws_secret_access_key:
+            return AWSClientCredentials(
+                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=self.aws_secret_access_key,
+                aws_session_token=self.aws_session_token,
+            )
+
+        if self.aws_assume_role_arn:
+            return AWSAssumeRoleCredentials(
+                aws_assume_role_arn=self.aws_assume_role_arn
+            )
+
+        return None
+
+
+class OverrideNameUpstreamConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    compatible_model_id: str | None = None
+
+
+def get_compatible_model_id(request: fastapi.Request) -> str | None:
+    if (extra := request.headers.get(_UPSTREAM_CONFIG_HEADER_NAME)) is None:
+        return None
+
+    try:
+        conf = OverrideNameUpstreamConfig.model_validate_json(extra)
+    except Exception as e:
+        log.error(
+            f"Request header {_UPSTREAM_CONFIG_HEADER_NAME!r} doesn't contain"
+            f" valid override name configuration: {e}"
+        )
+        return None
+
+    return None if conf is None else conf.compatible_model_id
