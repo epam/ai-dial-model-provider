@@ -1,4 +1,4 @@
-# One image, one process, one dependency set (docs/design.md §4). The four
+# One image, one process, one dependency set. The four
 # adapters are packages in this project, not separate projects: they are resolved
 # and locked together because they are installed into the same interpreter.
 [build-system]
@@ -29,7 +29,7 @@ package-mode = false
 # The composition root's own dependencies. Importing an adapter adds that
 # provider's stack here: openai+tiktoken, google-cloud-aiplatform, boto3,
 # anthropic[vertex,bedrock] … all of them in one resolution, which is what
-# forces the version reconciliation listed in docs/design.md §4.
+# forces the version reconciliation below.
 [tool.poetry.dependencies]
 # The composition root's own, at the versions the adapters agreed on.
 fastapi = "0.136.3"

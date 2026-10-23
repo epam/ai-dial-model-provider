@@ -1,4 +1,4 @@
-# One image serving every adapter (docs/design.md §4). alpine and geos-dev
+# One image serving every adapter. alpine and geos-dev
 # come from the vertexai adapter, the tiktoken cache from the openai one; the
 # rest is what all four Dockerfiles already had in common.
 FROM python:3.11-alpine AS builder
