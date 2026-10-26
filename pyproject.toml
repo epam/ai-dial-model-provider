@@ -82,15 +82,15 @@ pytest-dotenv = "^0.5.2"
 pytest-html = "^4.1.1"
 allure-pytest = "^2.13.5"
 python-dotenv = "1.2.2"
-respx = "^0.22.0"  # dial declares ^0.21.1 — disjoint, max wins
+respx = "^0.22.0"         # dial declares ^0.21.1 — disjoint, max wins
 asgi-lifespan = "2.1.0"
 rapidfuzz = "^3.14.1"
 aiointercept = "^0.1.5"
-httpx2 = "^2.7.0"  # starlette.testclient wants httpx 2.x
+httpx2 = "^2.7.0"         # starlette.testclient wants httpx 2.x
 
 [tool.poetry.group.lint.dependencies]
 ruff = "0.12.11"
-pyright = "1.1.408"  # the version all four adapters lint with
+pyright = "1.1.408" # the version all four adapters lint with
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.5.1"
@@ -132,6 +132,11 @@ filterwarnings = [
   "ignore:This feature is deprecated as of June 24:UserWarning",
   # starlette.testclient, reached by this repo's own tests
   "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+  # google-api-core warns a year ahead of the running Python's EOL; for 3.11
+  # (EOL 2027-10-24) that started on 2026-10-24. Each google package names
+  # itself at the end of the message, so the pattern stops before that.
+  # Remove once CI moves off 3.11.
+  "ignore:You are using a Python version .* which Google will stop supporting in new releases of:FutureWarning",
 ]
 
 [tool.pyright]
