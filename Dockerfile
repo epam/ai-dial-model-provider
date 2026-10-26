@@ -37,10 +37,10 @@ RUN apk add --no-cache ca-certificates mailcap && update-ca-certificates
 
 # fix CVE-2026-85091 and CVE-2026-107891
 RUN apk upgrade --no-cache musl musl-utils zlib
-# fix CVE-2026-59890, and CVE-2026-23949 and CVE-2026-24049 in the copies of
-# jaraco.context and wheel that setuptools vendors -- a top-level `pip install
-# wheel` does not reach those.
-RUN pip install setuptools==83.0.0
+# fix CVE-2026-59890 and GHSA-xmj3-9gf7-h52w, and CVE-2026-23949 and
+# CVE-2026-24049 in the copies of jaraco.context and wheel that setuptools
+# vendors -- a top-level `pip install wheel` does not reach those.
+RUN pip install setuptools==84.2.1
 # pip is not needed at runtime; removing it fixes every pip CVE. Must stay
 # after the install above.
 RUN pip uninstall -y pip
