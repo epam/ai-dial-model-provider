@@ -34,7 +34,7 @@ package-mode = false
 # The composition root's own, at the versions the adapters agreed on.
 fastapi = "0.136.3"
 uvicorn = { version = "0.23.2", extras = ["standard"] }
-aidial-sdk = { version = "0.45.0", extras = ["telemetry"] }
+aidial-sdk = { version = "0.46.0", extras = ["telemetry"] }
 
 # The union of what the four vendored adapters declare. One interpreter
 # means one resolved version of each, so anything they disagreed on is resolved
@@ -66,8 +66,8 @@ aws-bedrock-token-generator = "^1.1.0"
 google-cloud-aiplatform = "1.138.0"
 google-auth = "2.49.0"
 google-genai = "1.72.0"
-pypdf = { version = "6.21.1", extras = ["crypto"] }
-mistralai = { version = "2.4.3", extras = ["gcp"] }
+pypdf = { version = "6.21.2", extras = ["crypto"] }
+mistralai = { version = "2.9.4", extras = ["gcp"] }
 
 [tool.poetry.group.test.dependencies]
 # Union of the four test groups: `make test` runs each adapter's suite with that
