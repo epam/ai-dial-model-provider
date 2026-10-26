@@ -66,7 +66,7 @@ aws-bedrock-token-generator = "^1.1.0"
 google-cloud-aiplatform = "1.138.0"
 google-auth = "2.49.0"
 google-genai = "1.72.0"
-pypdf = { version = "6.21.1", extras = ["crypto"] }
+pypdf = { version = "6.21.2", extras = ["crypto"] }
 mistralai = { version = "2.4.3", extras = ["gcp"] }
 
 [tool.poetry.group.test.dependencies]
