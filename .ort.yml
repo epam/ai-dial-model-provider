@@ -12,3 +12,11 @@ excludes:
     - pattern: "test"
       reason: "TEST_DEPENDENCY_OF"
       comment: "Packages for testing only."
+resolutions:
+  rule_violations:
+    - message: ".*PyPI::google-crc32c:1\\.8\\.0.*"
+      reason: "CANT_FIX_EXCEPTION"
+      comment: "Apache-2.0 License: https://github.com/googleapis/python-crc32c/blob/v1.8.0/LICENSE"
+    - message: ".*PyPI::httpx-aiohttp:0\\.2\\.0.*"
+      reason: "CANT_FIX_EXCEPTION"
+      comment: "BSD 3-Clause New or Revised License: https://github.com/karpetrosyan/httpx-aiohttp/blob/0.2.0/LICENSE"
