@@ -15,7 +15,9 @@
 
 - [Overview](#overview)
   - [Served paths](#served-paths)
+    - [Compatibility mode](#compatibility-mode)
   - [Configuration](#configuration)
+  - [Migration](#migration)
   - [Development](#development)
     - [Development Environment](#development-environment)
     - [Setup](#setup)
@@ -34,6 +36,9 @@ LLM Adapters unify the APIs of respective LLMs to align with the Unified Protoco
 
 This project serves four DIAL adapters from **one image and one process**, each mounted under its own path prefix. The adapters themselves are unchanged: their sources are vendored here from the upstream repositories, so the models they support and the [AI DIAL API](https://dialx.ai/dial_api) they implement are exactly the ones documented there.
 
+> [!WARNING]
+> The component is still at the stage of the active development and testing.
+
 ## Served paths
 
 | Path prefix | Adapter | Models |
@@ -44,7 +49,9 @@ This project serves four DIAL adapters from **one image and one process**, each 
 | `/compat/dial/…` | [ai-dial-adapter-dial](https://github.com/epam/ai-dial-adapter-dial) | another DIAL Core instance |
 | `/health` | this process | liveness of the whole container |
 
-The tail of each path is the adapter's own DIAL API surface, unchanged — only the prefix is new. A DIAL Core upstream endpoint that pointed at `http://adapter-bedrock:5000/openai/deployments/{id}/chat/completions` becomes `http://model-provider:5000/compat/bedrock/openai/deployments/{id}/chat/completions`.
+### Compatibility mode
+
+One process serves all four adapters, so the adapter is named by a segment of the base URL: `/compat/<adapter>/…`. The tail of each path is the adapter's own DIAL API surface, unchanged — only the prefix is new. A DIAL Core upstream endpoint that pointed at `http://adapter-bedrock:5000/openai/deployments/{id}/chat/completions` becomes `http://model-provider:5000/compat/bedrock/openai/deployments/{id}/chat/completions`.
 
 The prefix names the **adapter**, not the cloud: OpenAI models hosted on AWS Bedrock are served by `/compat/openai`, and Claude arrives through both `/compat/vertexai` and `/compat/bedrock`.
 
@@ -53,6 +60,79 @@ The prefix names the **adapter**, not the cloud: OpenAI models hosted on AWS Bed
 Every adapter reads the same environment variables it reads upstream, in one shared process environment. **See the respective adapter's README for its variables, supported models and per-deployment settings** — the table above links to all four.
 
 See [`.env.example`](.env.example) for the shape of a local configuration.
+
+## Migration
+
+Migrating a DIAL Core configuration is a find-and-replace over every endpoint that points at one of the four adapters: the adapter's origin becomes the model provider's, with the adapter's `/compat` prefix in front of the path.
+
+```text
+http://adapter-openai:5000/…    →  http://model-provider:5000/compat/openai/…
+http://adapter-vertexai:5000/…  →  http://model-provider:5000/compat/vertexai/…
+http://adapter-bedrock:5000/…   →  http://model-provider:5000/compat/bedrock/…
+http://adapter-dial:5000/…      →  http://model-provider:5000/compat/dial/…
+```
+
+Nothing else changes: the path after the origin, the `upstreams` and the keys stay as they are.
+
+<details>
+<summary>Before migration</summary>
+
+```json
+{
+  "models": {
+    "gpt-4o": {
+      "type": "chat",
+      "endpoint": "http://adapter-openai:5000/openai/deployments/gpt-4o/chat/completions",
+      "upstreams": [
+        {
+          "endpoint": "https://contoso.openai.azure.com/openai/deployments/gpt-4o/chat/completions",
+          "key": "AZURE_OPENAI_KEY"
+        }
+      ]
+    },
+    "gemini-2.5-pro": {
+      "type": "chat",
+      "endpoint": "http://adapter-vertexai:5000/openai/deployments/gemini-2.5-pro/chat/completions"
+    },
+    "anthropic.claude-sonnet-4-5": {
+      "type": "chat",
+      "endpoint": "http://adapter-bedrock:5000/openai/deployments/anthropic.claude-sonnet-4-5-20250929-v1:0/chat/completions"
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>After migration</summary>
+
+```json
+{
+  "models": {
+    "gpt-4o": {
+      "type": "chat",
+      "endpoint": "http://model-provider:5000/compat/openai/openai/deployments/gpt-4o/chat/completions",
+      "upstreams": [
+        {
+          "endpoint": "https://contoso.openai.azure.com/openai/deployments/gpt-4o/chat/completions",
+          "key": "AZURE_OPENAI_KEY"
+        }
+      ]
+    },
+    "gemini-2.5-pro": {
+      "type": "chat",
+      "endpoint": "http://model-provider:5000/compat/vertexai/openai/deployments/gemini-2.5-pro/chat/completions"
+    },
+    "anthropic.claude-sonnet-4-5": {
+      "type": "chat",
+      "endpoint": "http://model-provider:5000/compat/bedrock/openai/deployments/anthropic.claude-sonnet-4-5-20250929-v1:0/chat/completions"
+    }
+  }
+}
+```
+
+</details>
 
 ## Development
 
