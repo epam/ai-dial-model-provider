@@ -10,6 +10,8 @@ dropped should fail here, which it cannot do if the expectation comes from the
 code under test.
 """
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -64,3 +66,20 @@ def test_chat_completions_reaches_the_adapter(client, adapter):
 def test_unknown_prefix_is_not_served(client):
     path = "/compat/nope/openai/deployments/gpt-4/chat/completions"
     assert client.post(path, json={}).status_code == 404
+
+
+def test_health_access_logs_are_muted():
+    def access(path: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            __file__,
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("10.0.0.1:1234", "GET", path, "1.1", 200),
+            None,
+        )
+
+    uvicorn_access = logging.getLogger("uvicorn.access")
+    assert not uvicorn_access.filter(access("/health"))
+    assert uvicorn_access.filter(access("/compat/openai/health"))

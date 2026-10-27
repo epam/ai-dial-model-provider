@@ -1,5 +1,7 @@
+import logging
 from contextlib import asynccontextmanager
 
+from aidial_sdk.application import PathFilter
 from aidial_sdk.telemetry.init import init_telemetry as sdk_init_telemetry
 from aidial_sdk.telemetry.types import TelemetryConfig
 from fastapi import FastAPI
@@ -34,6 +36,7 @@ sdk_init_telemetry(app, TelemetryConfig())
 configure_loggers()
 
 app.get("/health")(health)
+logging.getLogger("uvicorn.access").addFilter(PathFilter("/health"))
 
 app.mount("/compat/openai", openai_app)
 app.mount("/compat/vertexai", vertexai_app)
