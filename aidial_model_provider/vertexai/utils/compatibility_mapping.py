@@ -79,7 +79,7 @@ def parse_compat_mapping(compat_mapping: dict[str, str]):
         )
 
     if unknown:
-        raise ValueError(
+        log.warning(
             f"None of the values in the following compatibility mapping corresponds to a "
             f"VertexAI deployment supported by the adapter: {json.dumps(unknown)}. "
             f"Remap the deployments to the supported VertexAI deployments to fix the error."

@@ -109,7 +109,7 @@ test_cases: list[TestCase] = [
     TestCase(
         desc="invalid compat",
         compat={"xxx": "yyy", "zzz": "ddd"},
-        error='None of the values in the following compatibility mapping corresponds to a Bedrock deployment supported by the adapter: {"xxx": "yyy", "zzz": "ddd"}. Remap the deployments to the supported Bedrock deployments to fix the error.',
+        warning='None of the values in the following compatibility mapping corresponds to a Bedrock deployment supported by the adapter: {"xxx": "yyy", "zzz": "ddd"}. Remap the deployments to the supported Bedrock deployments to fix the error.',
     ),
     TestCase(
         desc="partially invalid compat",
@@ -117,7 +117,8 @@ test_cases: list[TestCase] = [
             "xxx": "yyy",
             "zzz": _CHAT_MODEL_1.value,
         },
-        error='None of the values in the following compatibility mapping corresponds to a Bedrock deployment supported by the adapter: {"xxx": "yyy"}. Remap the deployments to the supported Bedrock deployments to fix the error.',
+        warning='None of the values in the following compatibility mapping corresponds to a Bedrock deployment supported by the adapter: {"xxx": "yyy"}. Remap the deployments to the supported Bedrock deployments to fix the error.',
+        checks=[compat("zzz", _CHAT_MODEL_1)],
     ),
     TestCase(
         desc="compat chat+embeddings",
