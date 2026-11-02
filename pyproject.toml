@@ -45,7 +45,10 @@ httpx = "0.28.1"
 aiohttp = "3.14.4"
 pillow = "13.0.0"
 anthropic = { version = "0.105.0", extras = ["vertex", "bedrock", "aiohttp"] }
-aidial-adapter-anthropic = { version = "0.20.0", extras = ["bedrock"] }
+# EXPERIMENT, do not merge: epam/ai-dial-adapter-anthropic branch
+# perf/passthrough-orjson (development + orjson in the passthrough; the
+# passthrough is otherwise unchanged since 0.20.0).
+aidial-adapter-anthropic = { git = "https://github.com/epam/ai-dial-adapter-anthropic.git", rev = "cee38945034494442e959beccec44dd4681ec7b3", extras = ["bedrock"] }
 
 # Divergences the all-four sync never covered: each is declared by only two or
 # three adapters, so it was never in the intersection. Resolved to the maximum.
