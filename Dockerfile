@@ -19,6 +19,10 @@ RUN poetry install --no-interaction --no-ansi --no-cache --no-root \
 # final stage -- so its pip, and the CVEs in it, would travel along.
 RUN .venv/bin/python -m pip uninstall -y pip
 
+# poetry.toml builds protobuf from its sdist; fail the build if the image still
+# got the pure-Python fallback, which only shows up on alpine.
+RUN .venv/bin/python -c "from google.protobuf.internal import api_implementation as a; assert a.Type() == 'upb', a.Type()"
+
 # Download tiktoken model encodings
 ENV TIKTOKEN_CACHE_DIR=/app/tiktoken_cache
 RUN .venv/bin/python -c "from tiktoken.model import (get_encoding as load, MODEL_TO_ENCODING as models); [(print(f'Loading tiktoken tokenizer {e}...'), load(e)) for e in set(models.values())]"
