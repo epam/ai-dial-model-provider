@@ -1,3 +1,4 @@
+import gc
 import logging
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,10 @@ async def lifespan(_: FastAPI):
         vertexai_lifespan(vertexai_app),
         bedrock_lifespan(bedrock_app),
     ):
+        # The modules leave ~1.2M objects that live as long as the process.
+        # Excluding them from the gc traversal.
+        gc.collect()
+        gc.freeze()
         yield
 
 
