@@ -17,6 +17,7 @@
   - [Served paths](#served-paths)
     - [Compatibility mode](#compatibility-mode)
   - [Configuration](#configuration)
+    - [Keep-alive timeout](#keep-alive-timeout)
   - [Migration](#migration)
   - [Development](#development)
     - [Development Environment](#development-environment)
@@ -60,6 +61,28 @@ The prefix names the **adapter**, not the cloud: OpenAI models hosted on AWS Bed
 Every adapter reads the same environment variables it reads upstream, in one shared process environment. **See the respective adapter's README for its variables, supported models and per-deployment settings** — the table above links to all four.
 
 See [`.env.example`](.env.example) for the shape of a local configuration.
+
+The process itself reads one more:
+
+|Variable|Default|Description|
+|---|---|---|
+|TIMEOUT_KEEP_ALIVE|70|How long in seconds the server keeps an idle HTTP keep-alive connection open before closing it. Must be greater than the caller's pooled-connection timeout — see [Keep-alive timeout](#keep-alive-timeout)|
+
+### Keep-alive timeout
+
+`TIMEOUT_KEEP_ALIVE` is passed to uvicorn as [`--timeout-keep-alive`](https://www.uvicorn.org/settings/#timeouts). It sets how long, in seconds, the model provider keeps an idle HTTP keep-alive connection open before closing it.
+
+The caller must give up on an idle connection *before* the model provider closes it. On the DIAL Core side the matching setting is `client.keepAliveTimeout` — the [Vert.x HTTP client option](https://vertx.io/docs/apidocs/io/vertx/core/http/HttpClientOptions.html) that controls how long Core keeps an idle connection in its pool. It is also expressed in seconds and defaults to **60**.
+
+**Keep `TIMEOUT_KEEP_ALIVE` at DIAL Core's `client.keepAliveTimeout` plus 10 seconds:**
+
+|DIAL Core `client.keepAliveTimeout`|`TIMEOUT_KEEP_ALIVE`|
+|---|---|
+|60 *(default)*|70 *(default)*|
+
+The default of 70 already covers an unmodified DIAL Core, so change it only if you have changed `client.keepAliveTimeout`.
+
+Note that uvicorn's own default of 5 seconds is **not** safe here. The model provider would close idle connections long before Core expires them; Core would eventually hand a request to a connection the model provider had already closed; and that request — written into a half-closed socket and never read — would fail with `Connection was closed`. The 10 second margin keeps Core the side that always closes first, which removes the race.
 
 ## Migration
 
@@ -144,7 +167,7 @@ This project requires [Python ≥3.11](https://www.python.org/downloads/) and [P
 
 1. Install Poetry. See the official [installation guide](https://python-poetry.org/docs/#installation).
 
-2. _(Optional)_ Specify a custom Poetry executable in `.env.dev`. This is useful if multiple versions are installed. By default, `poetry` is used.
+2. *(Optional)* Specify a custom Poetry executable in `.env.dev`. This is useful if multiple versions are installed. By default, `poetry` is used.
 
    ```sh
    POETRY=path-to-poetry-exe

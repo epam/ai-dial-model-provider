@@ -6,6 +6,7 @@ there is silent: the adapter serves requests normally and leaks whatever client
 its lifespan would have closed.
 """
 
+import gc
 from contextlib import asynccontextmanager
 
 import pytest
@@ -54,6 +55,12 @@ async def test_every_adapter_lifespan_is_entered(events: list[str]):
     assert events[len(COMPOSED) :] == [
         f"{name}:stop" for name in reversed(COMPOSED)
     ]
+
+
+async def test_startup_objects_are_frozen(events: list[str]):
+    gc.unfreeze()
+    async with composition_root.lifespan(composition_root.app):
+        assert gc.get_freeze_count() > 0
 
 
 @pytest.mark.parametrize(
