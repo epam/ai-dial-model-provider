@@ -1,10 +1,5 @@
 [virtualenvs]
 in-project = true
 
-# As in all four adapters. protobuf ships no musllinux wheel, so on the alpine
-# image poetry would install the pure-Python one: the OTLP exporters then
-# encode every span and log record in Python, ~18% of the CPU under load.
-# Built from the sdist it gets the C implementation (upb); the Dockerfile
-# checks that it did.
 [installer]
 no-binary = ["protobuf"]

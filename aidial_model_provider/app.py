@@ -24,10 +24,8 @@ async def lifespan(_: FastAPI):
         vertexai_lifespan(vertexai_app),
         bedrock_lifespan(bedrock_app),
     ):
-        # The four adapters' modules leave ~1.2M objects that live as long as
-        # the process, five times what one adapter has. Every full collection
-        # walks them all and stalls the event loop for most of a second;
-        # frozen, they are never walked again.
+        # The modules leave ~1.2M objects that live as long as the process.
+        # Excluding them from the gc traversal.
         gc.collect()
         gc.freeze()
         yield

@@ -58,8 +58,6 @@ async def test_every_adapter_lifespan_is_entered(events: list[str]):
 
 
 async def test_startup_objects_are_frozen(events: list[str]):
-    # Unfrozen, every full collection walks the ~1.2M objects the four
-    # adapters' modules leave, and stalls the event loop for most of a second.
     gc.unfreeze()
     async with composition_root.lifespan(composition_root.app):
         assert gc.get_freeze_count() > 0
