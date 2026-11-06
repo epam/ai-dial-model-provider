@@ -1,4 +1,4 @@
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import fastapi
 from aidial_sdk.chat_completion import Request as DIALRequest
@@ -20,6 +20,7 @@ from aidial_model_provider.openai.image_generation.model import (
 )
 from aidial_model_provider.openai.image_generation.prompt import ImageGenPrompt
 from aidial_model_provider.openai.utils.streaming import generate_id
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 _Config = TypeVar("_Config", bound=BaseModel)
 
@@ -29,13 +30,13 @@ async def chat_completion(
     request: fastapi.Request,
     model: ImageGenerationModel[_Config],
     deployment_id: str,
-    request_body: Any,
+    request_body: RequestValue,
     client: AsyncAzureOpenAI | AsyncOpenAI,
     file_storage: FileStorage | None,
 ) -> StreamingResponse | dict:
     prompt = await ImageGenPrompt.from_request(request_body, file_storage)
 
-    n = int(request_body.get("n", 1))
+    n = request_body.get_int("n", 1)
 
     config_cls = model.get_configuration()
     response_format = model.get_response_format()

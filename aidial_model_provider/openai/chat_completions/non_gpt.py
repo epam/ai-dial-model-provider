@@ -9,10 +9,11 @@ from aidial_model_provider.openai.utils.streaming import (
     chunk_to_dict,
     map_stream,
 )
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 
 async def chat_completion(
-    *, request: dict, client: AsyncAzureOpenAI | AsyncOpenAI
+    *, request: RequestValue, client: AsyncAzureOpenAI | AsyncOpenAI
 ) -> AsyncIterator[dict] | dict:
     response: (
         AsyncStream[ChatCompletionChunk] | ChatCompletion

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import mimetypes
-from typing import Any
 
 from aidial_sdk.exceptions import InvalidRequestError
 from httpx._types import RequestFiles
@@ -15,6 +14,7 @@ from aidial_model_provider.openai.dial_api.request import (
 )
 from aidial_model_provider.openai.dial_api.storage import FileStorage
 from aidial_model_provider.openai.utils.resource.base import Resource
+from aidial_model_provider.openai.utils.validation import RequestValue
 from aidial_model_provider.openai.video_generation.azure.types import (
     InpaintItem,
     MediaItemType,
@@ -27,7 +27,7 @@ class VideoGenPrompt(BaseModel):
 
     @classmethod
     async def from_request(
-        cls, data: Any, file_storage: FileStorage | None
+        cls, data: RequestValue, file_storage: FileStorage | None
     ) -> VideoGenPrompt:
         last_message = data["messages"][-1]
 

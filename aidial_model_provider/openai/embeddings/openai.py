@@ -3,11 +3,12 @@ from openai.types.create_embedding_response import CreateEmbeddingResponse
 from aidial_model_provider.openai.utils.auth import OpenAICreds
 from aidial_model_provider.openai.utils.parsers import embeddings_parser
 from aidial_model_provider.openai.utils.reflection import call_with_extra_body
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 
 async def embeddings(
     *,
-    request: dict,
+    request: RequestValue,
     creds: OpenAICreds,
     endpoint: str,
     api_version: str | None,

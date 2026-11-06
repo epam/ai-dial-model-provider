@@ -40,12 +40,13 @@ from aidial_model_provider.openai.utils.truncation_types import (
     DiscardedMessages,
     TruncatedTokens,
 )
+from aidial_model_provider.openai.utils.validation import RequestValue
 from aidial_model_provider.utils.log_config import logger
 
 
 async def truncate_gpt_prompt(
     *,
-    request: dict,
+    request: RequestValue,
     file_storage: FileStorage | None,
     max_prompt_tokens: int,
     tokenizer: Tokenizer,
@@ -65,7 +66,7 @@ async def truncate_gpt_prompt(
 
 async def chat_completion(
     *,
-    request: dict,
+    request: RequestValue,
     request_headers: Mapping[str, str],
     client: AsyncAzureOpenAI | AsyncOpenAI,
     file_storage: FileStorage | None,
@@ -73,13 +74,13 @@ async def chat_completion(
     eliminate_empty_choices: bool,
     vendor_adapter: VendorAdapter,
 ) -> ResponseWithHeaders[AsyncIterator[dict] | dict]:
-    n: int = request.get("n") or 1
-    model_name = request["model"]
+    n = request.get_int("n", 1)
+    model_name = request["model"].to_str()
 
     # Computed upfront: the path must address the request body
     # as DIAL Core has sent it, before the truncation reindexes messages.
     breakpoint_path = get_chat_completions_breakpoint_path(
-        cast(CompletionCreateParamsBase, request)
+        cast(CompletionCreateParamsBase, request.unwrap_dict())
     )
 
     max_prompt_tokens = extract_max_prompt_tokens(request)
@@ -122,7 +123,7 @@ async def chat_completion(
 
     # The upstream-specific rewrites go last, once the request is final
     vendor_adapter.transform_chat_completions_request(
-        cast(ChatCompletionRequest, request)
+        cast(ChatCompletionRequest, request.unwrap_dict())
     )
 
     response: (

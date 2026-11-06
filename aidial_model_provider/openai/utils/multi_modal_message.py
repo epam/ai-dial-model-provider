@@ -6,6 +6,7 @@ from aidial_model_provider.openai.utils.resource.audio import AudioResource
 from aidial_model_provider.openai.utils.resource.base import Resource
 from aidial_model_provider.openai.utils.resource.file import FileResource
 from aidial_model_provider.openai.utils.resource.image import ImageResource
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 
 def create_file_content_part(filename: str, resource: Resource) -> File:
@@ -26,4 +27,4 @@ class MultiModalMessage(BaseModel):
     images: list[ImageResource] = []
     files: list[FileResource] = []
     audios: list[AudioResource] = []
-    raw_message: dict
+    raw_message: RequestValue

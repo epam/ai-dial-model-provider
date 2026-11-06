@@ -16,6 +16,7 @@ from aidial_model_provider.openai.utils.tokenizer import Tokenizer
 from aidial_model_provider.openai.utils.truncate_messages import (
     truncate_messages,
 )
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 tokenizer = Tokenizer(model="gpt-4o", image_tokenizer=GPT4O_IMAGE_TOKENIZER)
 
@@ -26,7 +27,9 @@ async def test_multimodal_truncate_with_system_and_last_user_error():
     """
     transformations = [
         MultiModalMessage(
-            raw_message={"role": "system", "content": "this is four tokens"},
+            raw_message=RequestValue(
+                {"role": "system", "content": "this is four tokens"}
+            ),
         ),
         MultiModalMessage(
             images=[
@@ -38,13 +41,15 @@ async def test_multimodal_truncate_with_system_and_last_user_error():
                     image=Resource(type="image/jpeg", data=b"..."),
                 )
             ],
-            raw_message={
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "this is four tokens"},
-                    {"type": "image_url", "image_url": "..."},
-                ],
-            },
+            raw_message=RequestValue(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "this is four tokens"},
+                        {"type": "image_url", "image_url": "..."},
+                    ],
+                }
+            ),
         ),
     ]
     with pytest.raises(TruncatePromptSystemAndLastUserError):
@@ -54,7 +59,9 @@ async def test_multimodal_truncate_with_system_and_last_user_error():
             is_system_message=lambda message: message.raw_message["role"]
             == "system",
             max_prompt_tokens=15,
-            initial_prompt_tokens=await tokenizer.tokenize_request({}, []),
+            initial_prompt_tokens=await tokenizer.tokenize_request(
+                RequestValue({}), []
+            ),
         )
 
 
@@ -62,7 +69,9 @@ async def test_multimodal_truncate_with_system_error():
     # 4 tokens for content + 3 tokens for message + 3 tokens for request = 10 tokens
     transformations = [
         MultiModalMessage(
-            raw_message={"role": "system", "content": "this is four tokens"},
+            raw_message=RequestValue(
+                {"role": "system", "content": "this is four tokens"}
+            ),
         ),
     ]
     with pytest.raises(TruncatePromptSystemError):
@@ -72,7 +81,9 @@ async def test_multimodal_truncate_with_system_error():
             is_system_message=lambda message: message.raw_message["role"]
             == "system",
             max_prompt_tokens=9,
-            initial_prompt_tokens=await tokenizer.tokenize_request({}, []),
+            initial_prompt_tokens=await tokenizer.tokenize_request(
+                RequestValue({}), []
+            ),
         )
 
 
@@ -85,24 +96,30 @@ async def test_multimodal_truncate_with_system_error():
             [
                 # 4 tokens of content + 3 tokens for message + 1 token of role key = 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "system",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "system",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "user",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "user",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
             ],
             25,
@@ -114,17 +131,21 @@ async def test_multimodal_truncate_with_system_error():
             [
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "system",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "system",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "user",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
             ],
             20,
@@ -136,17 +157,21 @@ async def test_multimodal_truncate_with_system_error():
             [
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "system",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "system",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "user",
-                        "content": "this if four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": "this if four tokens",
+                        }
+                    ),
                 ),
                 # 85 (image) + 8 (textual) = 93 tokens
                 MultiModalMessage(
@@ -158,16 +183,18 @@ async def test_multimodal_truncate_with_system_error():
                             image=Resource(type="image/jpeg", data=b"..."),
                         )
                     ],
-                    raw_message={
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "this is four tokens",
-                            },
-                            {"type": "image_url", "image_url": "..."},
-                        ],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "this is four tokens",
+                                },
+                                {"type": "image_url", "image_url": "..."},
+                            ],
+                        }
+                    ),
                 ),
             ],
             104,
@@ -180,14 +207,16 @@ async def test_multimodal_truncate_with_system_error():
             [
                 # 8 tokens
                 MultiModalMessage(
-                    raw_message={
-                        "role": "system",
-                        "content": "this is four tokens",
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "system",
+                            "content": "this is four tokens",
+                        }
+                    ),
                 ),
                 # 4 tokens
                 MultiModalMessage(
-                    raw_message={"role": "user", "content": None},
+                    raw_message=RequestValue({"role": "user", "content": None}),
                 ),
             ],
             15,
@@ -209,7 +238,9 @@ async def test_multimodal_truncate(
         is_system_message=lambda message: message.raw_message["role"]
         == "system",
         max_prompt_tokens=max_prompt_tokens,
-        initial_prompt_tokens=await tokenizer.tokenize_request({}, []),
+        initial_prompt_tokens=await tokenizer.tokenize_request(
+            RequestValue({}), []
+        ),
     )
     assert actual_discarded_messages == discarded_messages
     assert actual_used_tokens == used_tokens

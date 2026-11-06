@@ -36,6 +36,7 @@ from aidial_model_provider.openai.utils.streaming import (
     generate_created,
     generate_id,
 )
+from aidial_model_provider.openai.utils.validation import RequestValue
 from aidial_model_provider.utils.log_config import logger
 
 _UNABLE_TO_DETECT_LANGUAGE = "Unable to detect audio language. This typically occurs when the audio contains only silence, background noise, or music."
@@ -109,7 +110,7 @@ async def normalize_audio_response(response: AudioResponse) -> AudioResponse:
 async def chat_completion(
     *,
     request: fastapi.Request,
-    request_body: Any,
+    request_body: RequestValue,
     deployment_id: str,
     client: AsyncAzureOpenAI | AsyncOpenAI,
     file_storage: FileStorage | None,
@@ -130,7 +131,7 @@ async def chat_completion(
         model=deployment_id,
         stream=is_stream,
         response_format=response_format,
-        temperature=request_body.get("temperature") or omit,
+        temperature=request_body.get_float("temperature") or omit,
         **extra_body,
     )
 
