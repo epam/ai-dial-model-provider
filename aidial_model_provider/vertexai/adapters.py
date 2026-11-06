@@ -66,6 +66,8 @@ async def get_chat_completion_model(
             | D.GEMINI_3_1_FLASH_LITE_PREVIEW
             | D.GEMINI_3_1_FLASH_LITE
             | D.GEMINI_3_5_FLASH
+            | D.GEMINI_3_5_FLASH_LITE
+            | D.GEMINI_3_8_FLASH
             | D.GEMINI_3_5_TRANSCRIBE_PREVIEW
         ):
             return await GeminiGenAIChatCompletionAdapter.create(
@@ -88,6 +90,12 @@ async def get_chat_completion_model(
             | D.CLAUDE_4_6_SONNET
             | D.CLAUDE_4_6_OPUS
             | D.CLAUDE_4_5_OPUS
+            | D.CLAUDE_4_6_OPUS_DEFAULT
+            | D.CLAUDE_5_OPUS
+            | D.CLAUDE_5_SONNET
+            | D.CLAUDE_5_5_OPUS
+            | D.CLAUDE_5_5_SONNET
+            | D.CLAUDE_5_5_HAIKU
         ):
             return await ClaudeChatCompletionAdapter.create(
                 storage,
@@ -154,6 +162,7 @@ async def get_embeddings_model(
             | E.TEXT_EMBEDDING_5
             | E.TEXT_MULTILINGUAL_EMBEDDING_2
             | E.GEMINI_EMBEDDING_2_PREVIEW
+            | E.GEMINI_EMBEDDING_2
         ):
             return await GenAIEmbeddingsAdapter.create(
                 storage=storage,
