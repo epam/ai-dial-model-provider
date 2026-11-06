@@ -12,6 +12,7 @@ from aidial_model_provider.openai.utils.multi_modal_message import (
 from aidial_model_provider.openai.utils.resource.base import Resource
 from aidial_model_provider.openai.utils.resource.file import FileResource
 from aidial_model_provider.openai.utils.resource.image import ImageResource
+from aidial_model_provider.openai.utils.validation import RequestValue
 from tests.utils.openai.images import data_url, pic_1_1, pic_2_2, pic_3_3
 from tests.utils.openai.storage import DummyFileStorage
 
@@ -124,7 +125,9 @@ async def test_transform_to_content_parts(
     message,
     expected_content,
 ):
-    result = await mock_message_transformer.transform_message(message)
+    result = await mock_message_transformer.transform_message(
+        RequestValue(message)
+    )
 
     assert isinstance(result, MultiModalMessage)
     assert result.raw_message.get("custom_content") is None
@@ -148,7 +151,7 @@ async def test_transform_messages_not_found(
     ]
 
     with pytest.raises(DialException) as exc:
-        await mock_resource_processor.transform_messages(messages)
+        await mock_resource_processor.transform_messages(RequestValue(messages))
 
     assert (
         exc.value.message
@@ -168,7 +171,7 @@ async def test_transform_message_not_found(
         "content": "",
         "custom_content": {"attachments": [{"url": "not_found.jpg"}]},
     }
-    await mock_message_transformer.transform_message(message)
+    await mock_message_transformer.transform_message(RequestValue(message))
     assert mock_message_transformer.errors is not None
     assert len(mock_message_transformer.errors) == 1
     image_fail = list(mock_message_transformer.errors)[0]
@@ -184,7 +187,9 @@ async def test_transform_message_not_found(
             [{"role": "user", "content": "Hello"}],
             [
                 MultiModalMessage(
-                    raw_message={"role": "user", "content": "Hello"},
+                    raw_message=RequestValue(
+                        {"role": "user", "content": "Hello"}
+                    ),
                 )
             ],
         ),
@@ -199,14 +204,18 @@ async def test_transform_message_not_found(
             ],
             [
                 MultiModalMessage(
-                    raw_message={"role": "system", "content": "Hello"},
+                    raw_message=RequestValue(
+                        {"role": "system", "content": "Hello"}
+                    ),
                 ),
                 MultiModalMessage(
                     images=[image_resource(pic_1_1, 1, 1)],
-                    raw_message={
-                        "role": "user",
-                        "content": [text_part(""), image_part(pic_1_1)],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [text_part(""), image_part(pic_1_1)],
+                        }
+                    ),
                 ),
             ],
         ),
@@ -227,19 +236,23 @@ async def test_transform_message_not_found(
             ],
             [
                 MultiModalMessage(
-                    raw_message={"role": "system", "content": "Hello"},
+                    raw_message=RequestValue(
+                        {"role": "system", "content": "Hello"}
+                    ),
                 ),
                 MultiModalMessage(
-                    raw_message={
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "User",
-                                "extra_field": "extra_value",
-                            }
-                        ],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "User",
+                                    "extra_field": "extra_value",
+                                }
+                            ],
+                        }
+                    ),
                 ),
             ],
         ),
@@ -257,13 +270,15 @@ async def test_transform_message_not_found(
             [
                 MultiModalMessage(
                     images=[image_resource(pic_1_1, 1, 1)],
-                    raw_message={
-                        "role": "user",
-                        "content": [
-                            text_part("User"),
-                            image_part(pic_1_1),
-                        ],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [
+                                text_part("User"),
+                                image_part(pic_1_1),
+                            ],
+                        }
+                    ),
                 )
             ],
         ),
@@ -291,15 +306,17 @@ async def test_transform_message_not_found(
                         image_resource(pic_2_2, 2, 2),
                         image_resource(pic_3_3, 3, 3),
                     ],
-                    raw_message={
-                        "role": "user",
-                        "content": [
-                            image_part(pic_1_1),
-                            text_part("User"),
-                            image_part(pic_2_2),
-                            image_part(pic_3_3),
-                        ],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [
+                                image_part(pic_1_1),
+                                text_part("User"),
+                                image_part(pic_2_2),
+                                image_part(pic_3_3),
+                            ],
+                        }
+                    ),
                 )
             ],
         ),
@@ -334,14 +351,16 @@ async def test_transform_message_not_found(
                         image_resource(pic_1_1, 1, 1),
                     ],
                     files=[file_resource(_file_1)],
-                    raw_message={
-                        "role": "user",
-                        "content": [
-                            text_part("hello"),
-                            file_part(_file_1),
-                            image_part(pic_1_1),
-                        ],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [
+                                text_part("hello"),
+                                file_part(_file_1),
+                                image_part(pic_1_1),
+                            ],
+                        }
+                    ),
                 ),
                 MultiModalMessage(
                     images=[
@@ -349,15 +368,17 @@ async def test_transform_message_not_found(
                         image_resource(pic_3_3, 3, 3),
                     ],
                     files=[file_resource(_file_2)],
-                    raw_message={
-                        "role": "user",
-                        "content": [
-                            text_part("world"),
-                            image_part(pic_2_2),
-                            file_part(_file_2),
-                            image_part(pic_3_3),
-                        ],
-                    },
+                    raw_message=RequestValue(
+                        {
+                            "role": "user",
+                            "content": [
+                                text_part("world"),
+                                image_part(pic_2_2),
+                                file_part(_file_2),
+                                image_part(pic_3_3),
+                            ],
+                        }
+                    ),
                 ),
             ],
         ),
@@ -368,7 +389,9 @@ async def test_transform_to_unified_messages(
     messages,
     expected_transformations,
 ):
-    result = await mock_resource_processor.transform_messages(messages)
+    result = await mock_resource_processor.transform_messages(
+        RequestValue(messages)
+    )
     assert result == expected_transformations
 
 
@@ -387,9 +410,11 @@ async def test_audio_in_content_part(
             ],
         },
     ]
-    result = await mock_resource_processor.transform_messages(messages)
+    result = await mock_resource_processor.transform_messages(
+        RequestValue(messages)
+    )
     assert len(result) == 1
-    content = result[0].raw_message["content"]
+    content = result[0].raw_message["content"].unwrap()
     assert len(content) == 2
     assert content[1] == {
         "type": "input_audio",
@@ -409,12 +434,14 @@ async def test_audio_in_attachments(
             "attachments": [attachment(_audio_wav)],
         },
     }
-    result = await mock_message_transformer.transform_message(message)
+    result = await mock_message_transformer.transform_message(
+        RequestValue(message)
+    )
 
     assert isinstance(result, MultiModalMessage)
     assert len(result.audios) == 1
     assert result.audios[0].audio.type == "audio/wav"
     assert result.files == []
-    assert len(result.raw_message["content"]) == 2
+    assert len(result.raw_message["content"].unwrap()) == 2
     assert result.raw_message["content"][0] == text_part("listen")
     assert result.raw_message["content"][1]["type"] == "input_audio"

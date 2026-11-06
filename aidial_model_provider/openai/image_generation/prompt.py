@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from aidial_sdk.exceptions import InvalidRequestError
 from pydantic import BaseModel
 
@@ -13,6 +11,7 @@ from aidial_model_provider.openai.dial_api.request import (
 )
 from aidial_model_provider.openai.dial_api.storage import FileStorage
 from aidial_model_provider.openai.utils.resource.base import Resource
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 
 class ImageGenPrompt(BaseModel):
@@ -21,7 +20,7 @@ class ImageGenPrompt(BaseModel):
 
     @classmethod
     async def from_request(
-        cls, data: Any, file_storage: FileStorage | None
+        cls, data: RequestValue, file_storage: FileStorage | None
     ) -> ImageGenPrompt:
         result = await ResourceProcessor(
             file_storage=file_storage

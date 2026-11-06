@@ -164,7 +164,7 @@ def test_resolve_paths_serializes_json_values(
 
 
 def test_resolve_paths_logs_unresolved_path_error(caplog, jwt_auth: dict):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     assert session_tags.resolve_paths(jwt_auth, _paths("userClaims.nope")) == {}
 
@@ -182,7 +182,7 @@ def test_resolve_paths_logs_unresolved_path_error(caplog, jwt_auth: dict):
     ],
 )
 def test_resolve_paths_skips_unset_optional_fields_silently(caplog, data: dict):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     assert (
         session_tags.resolve_paths(
@@ -194,7 +194,7 @@ def test_resolve_paths_skips_unset_optional_fields_silently(caplog, data: dict):
 
 
 def test_resolve_paths_warns_on_missing_key_of_set_optional_field(caplog):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     assert (
         session_tags.resolve_paths(
@@ -396,7 +396,7 @@ def test_sanitize_session_tags_caps_at_50_entries():
 
 
 def test_sanitize_session_tags_logs_the_capped_entries_by_key(caplog):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     session_tags._sanitize_session_tags(
         [
@@ -448,7 +448,7 @@ def test_sanitize_session_tags_postfixes_sanitized_key_collisions():
 
 
 def test_sanitize_session_tags_logs_postfixed_key_collisions(caplog):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     session_tags._sanitize_session_tags(
         [
@@ -476,7 +476,7 @@ def test_sanitize_session_tags_drops_empty_keys_but_keeps_empty_values():
 def test_sanitize_session_tags_logs_the_source_of_an_empty_key(caplog):
     """An empty key can't name itself, so the value source identifies it."""
 
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     session_tags._sanitize_session_tags(
         [{"Key": "", "ValueSource": "UserInfo.project", "Value": "epam"}]
@@ -489,7 +489,7 @@ def test_sanitize_session_tags_logs_the_source_of_an_empty_key(caplog):
 
 
 def test_sanitize_session_tags_logs_truncated_keys_and_values(caplog):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
     long_key = "a" * 200
     long_value = "v" * 300
 
@@ -596,7 +596,7 @@ def test_tags_parse(config: dict[str, str], expected: Tags):
     "source", ["project", "Nope.project", "Bedrock.region", "UserInfoProject"]
 )
 def test_tags_parse_logs_unknown_value_sources(caplog, source: str):
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
 
     Tags.parse({"my_key": source})
 
@@ -748,7 +748,7 @@ async def test_resolve_session_tags_without_an_api_key(
 ):
     """A request with no DIAL API key still gets the other tag sources."""
 
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
     monkeypatch.setattr(
         session_tags,
         "AWS_SESSION_TAGS",
@@ -885,7 +885,7 @@ async def test_resolve_session_tags_no_dial_client(
 ):
     """DIAL_URL isn't set: the other tag sources are still passed."""
 
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
     monkeypatch.setattr(
         session_tags,
         "AWS_SESSION_TAGS",
@@ -950,7 +950,7 @@ async def test_resolve_session_tags_swallows_dial_errors(
 ):
     """A failed UserInfo request doesn't drop the other tag sources."""
 
-    caplog.set_level(logging.WARNING, logger="bedrock")
+    caplog.set_level(logging.WARNING, logger="aidial_model_provider")
     monkeypatch.setattr(
         session_tags,
         "AWS_SESSION_TAGS",

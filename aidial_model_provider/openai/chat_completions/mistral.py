@@ -7,6 +7,7 @@ from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 from aidial_model_provider.openai.utils.reflection import call_with_extra_body
 from aidial_model_provider.openai.utils.streaming import map_stream
+from aidial_model_provider.openai.utils.validation import RequestValue
 from aidial_model_provider.utils.log_config import logger
 
 
@@ -137,7 +138,7 @@ def _response_to_dict(obj: ChatCompletionChunk | ChatCompletion) -> dict:
 
 
 async def chat_completion(
-    *, request: dict, client: AsyncAzureOpenAI | AsyncOpenAI
+    *, request: RequestValue, client: AsyncAzureOpenAI | AsyncOpenAI
 ) -> AsyncIterator[dict] | dict:
     response: (
         AsyncStream[ChatCompletionChunk] | ChatCompletion

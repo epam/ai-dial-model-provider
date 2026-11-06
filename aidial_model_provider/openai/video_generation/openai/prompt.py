@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from aidial_sdk.exceptions import InvalidRequestError
 from openai._types import FileTypes
@@ -17,6 +16,7 @@ from aidial_model_provider.openai.dial_api.storage import FileStorage
 from aidial_model_provider.openai.utils.image import crop_image_file
 from aidial_model_provider.openai.utils.resource.base import Resource
 from aidial_model_provider.openai.utils.resource.image import ImageResource
+from aidial_model_provider.openai.utils.validation import RequestValue
 from aidial_model_provider.openai.video_generation.openai.configuration import (
     VideoGenerationConfig,
 )
@@ -28,7 +28,7 @@ class VideoGenPrompt(BaseModel):
 
     @classmethod
     async def from_request(
-        cls, data: Any, file_storage: FileStorage | None
+        cls, data: RequestValue, file_storage: FileStorage | None
     ) -> VideoGenPrompt:
         last_message = data["messages"][-1]
 

@@ -12,6 +12,7 @@ from aidial_model_provider.openai.utils.truncation_types import (
     DiscardedMessages,
     TruncatedTokens,
 )
+from aidial_model_provider.openai.utils.validation import RequestValue
 
 PlainTextMessages = list[dict]
 MaxPromptTokens = int
@@ -29,15 +30,19 @@ async def plain_text_truncate_prompt(
     tokenizer: Tokenizer,
 ) -> tuple[list[dict], DiscardedMessages, TruncatedTokens]:
     (msgs, disc, tokens) = await truncate_messages(
-        messages=[MultiModalMessage(raw_message=m) for m in messages],
+        messages=[
+            MultiModalMessage(raw_message=RequestValue(m)) for m in messages
+        ],
         message_tokens=tokenizer.tokenize_request_message,
         is_system_message=lambda message: message.raw_message["role"]
         == "system",
         max_prompt_tokens=max_prompt_tokens,
-        initial_prompt_tokens=await tokenizer.tokenize_request(request, []),
+        initial_prompt_tokens=await tokenizer.tokenize_request(
+            RequestValue(request), []
+        ),
     )
 
-    msgs = [m.raw_message for m in msgs]
+    msgs = [m.raw_message.unwrap() for m in msgs]
     return (msgs, disc, tokens)
 
 

@@ -18,6 +18,7 @@ def configure_loggers():
     for name in [
         "aidial_model_provider",
         "aidial_adapter_anthropic",
+        "aidial_sdk",
         "uvicorn",
         "__main__",
     ]:

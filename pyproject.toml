@@ -34,7 +34,7 @@ package-mode = false
 # The composition root's own, at the versions the adapters agreed on.
 fastapi = "0.136.3"
 uvicorn = { version = "0.23.2", extras = ["standard"] }
-aidial-sdk = { version = "0.46.0", extras = ["telemetry"] }
+aidial-sdk = { version = "0.47.1", extras = ["telemetry", "translators"] }
 
 # The union of what the four vendored adapters declare. One interpreter
 # means one resolved version of each, so anything they disagreed on is resolved
@@ -45,7 +45,7 @@ httpx = "0.28.1"
 aiohttp = "3.14.4"
 pillow = "13.0.0"
 anthropic = { version = "0.105.0", extras = ["vertex", "bedrock", "aiohttp"] }
-aidial-adapter-anthropic = { version = "0.20.0", extras = ["bedrock"] }
+aidial-adapter-anthropic = { version = "0.21.0", extras = ["bedrock"] }
 
 # Divergences the all-four sync never covered: each is declared by only two or
 # three adapters, so it was never in the intersection. Resolved to the maximum.

@@ -1,10 +1,9 @@
-from typing import Any
-
-from openai.types.shared_params import Reasoning
-from pydantic import Field
+from openai.types.shared_params import Reasoning, ReasoningEffort
+from pydantic import BaseModel, Field
 
 from aidial_model_provider.openai.dial_api.request import parse_configuration
 from aidial_model_provider.openai.utils.pydantic import ExtraAllowedModel
+from aidial_model_provider.openai.utils.validation import RequestValue
 from aidial_model_provider.utils.log_config import logger
 
 
@@ -15,15 +14,19 @@ class ResponsesConfig(ExtraAllowedModel):
     )
 
 
-def get_configuration(request: dict[str, Any]) -> ResponsesConfig:
+class _ChatCompletionReasoning(BaseModel):
+    reasoning_effort: ReasoningEffort = None
+
+
+def get_configuration(request: RequestValue) -> ResponsesConfig:
     configuration = (
         parse_configuration(ResponsesConfig, request) or ResponsesConfig()
     )
 
     if configuration.reasoning is None and (
-        reasoning_effort := request.get("reasoning_effort")
+        effort := request.to_model(_ChatCompletionReasoning).reasoning_effort
     ):
-        configuration.reasoning = Reasoning(effort=reasoning_effort)
+        configuration.reasoning = Reasoning(effort=effort)
 
     logger.debug(f"configuration: {configuration.model_dump_json()}")
     return configuration
