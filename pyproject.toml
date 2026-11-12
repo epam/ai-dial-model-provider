@@ -7,7 +7,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "aidial-model-adapter"
-version = "0.1.0rc0"
+version = "0.1.0"
 description = "DIAL model adapters for OpenAI, Vertex AI, Bedrock and DIAL"
 authors = [{ name = "EPAM RAIL", email = "SpecialEPM-DIALDevTeam@epam.com" }]
 license = "Apache-2.0"
