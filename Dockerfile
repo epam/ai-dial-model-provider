@@ -37,6 +37,13 @@ RUN apk add --no-cache ca-certificates mailcap && update-ca-certificates
 
 # fix CVE-2026-85091 and CVE-2026-107891
 RUN apk upgrade --no-cache musl musl-utils zlib
+# fix CVE-2026-40355, CVE-2026-40356, CVE-2026-71199, CVE-2026-71200,
+# CVE-2026-107364, CVE-2026-107708, CVE-2026-107778, CVE-2026-107884,
+# CVE-2026-111423, CVE-2026-112314, CVE-2026-112315, CVE-2026-112316,
+# CVE-2026-112317, CVE-2026-112318, CVE-2026-112319, CVE-2026-112320,
+# CVE-2026-112321, CVE-2026-112322, CVE-2026-112323, CVE-2026-118380,
+# CVE-2026-119079
+RUN apk upgrade --no-cache krb5-libs
 # fix CVE-2026-59890 and GHSA-xmj3-9gf7-h52w, and CVE-2026-23949 and
 # CVE-2026-24049 in the copies of jaraco.context and wheel that setuptools
 # vendors -- a top-level `pip install wheel` does not reach those.
