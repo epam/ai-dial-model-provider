@@ -51,6 +51,10 @@ RUN pip install setuptools==84.2.1
 # pip is not needed at runtime; removing it fixes every pip CVE. Must stay
 # after the install above.
 RUN pip uninstall -y pip
+# fix CVE-2025-8869, CVE-2026-1703, CVE-2026-3219, CVE-2026-6357, CVE-2026-8643 and CVE-2026-13346
+# pip-uninstall leaves the pip wheel bundled with the standard library (ensurepip) in place;
+# ensurepip is not used at runtime, so the wheel is removed.
+RUN rm -f /usr/local/lib/python3.11/ensurepip/_bundled/pip-*.whl
 
 WORKDIR /app
 
