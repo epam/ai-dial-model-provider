@@ -13,7 +13,7 @@ WORKDIR /app
 # does not re-resolve the (single, large) dependency set.
 COPY pyproject.toml poetry.lock poetry.toml ./
 RUN poetry install --no-interaction --no-ansi --no-cache --no-root \
-  --no-directory --only main
+  --no-directory --only main --compile
 
 # pip is not needed to run the server, and the venv is copied whole into the
 # final stage -- so its pip, and the CVEs in it, would travel along.
@@ -57,6 +57,10 @@ WORKDIR /app
 # Copy the sources and virtual env. No poetry.
 RUN adduser -u 1001 --disabled-password --gecos "" appuser
 COPY --chown=appuser --from=builder /app .
+
+# Precompile the sources' bytecode (the dependencies' was done by --compile in
+# the builder), so the container doesn't compile every imported module on startup
+RUN .venv/bin/python -m compileall -q aidial_model_provider
 
 COPY ./scripts/__cacert_entrypoint.sh /__cacert_entrypoint.sh
 RUN chmod +x /__cacert_entrypoint.sh

@@ -15,11 +15,11 @@ from aidial_model_provider.vertexai.chat_completion import (
     VertexAIChatCompletion,
 )
 from aidial_model_provider.vertexai.clients import (
+    check_default_config,
     get_anthropic_vertex_client,
     get_genai_client,
     get_httpx_client,
     get_mistral_gcp_client,
-    init_vertex_ai,
 )
 from aidial_model_provider.vertexai.dial_api.exceptions import (
     dial_exception_decorator,
@@ -35,19 +35,15 @@ from aidial_model_provider.vertexai.utils.adapter_deployments import (
 from aidial_model_provider.vertexai.utils.azure_auth import (
     close_azure_credential,
 )
-from aidial_model_provider.vertexai.vertex_ai import (
-    get_multi_modal_embedding_model,
-)
 
 
 @asynccontextmanager
 async def lifespan(_: DIALApp):
-    init_vertex_ai()
+    check_default_config()
     yield
     await get_httpx_client.clear()
     await get_genai_client.clear()
     await get_anthropic_vertex_client.clear()
-    await get_multi_modal_embedding_model.clear()
     await get_mistral_gcp_client.clear()
     await close_azure_credential()
 
