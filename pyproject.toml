@@ -27,7 +27,7 @@ Repository = "https://github.com/epam/ai-dial-model-adapter"
 package-mode = false
 
 # The composition root's own dependencies. Importing an adapter adds that
-# provider's stack here: openai+tiktoken, google-cloud-aiplatform, boto3,
+# provider's stack here: openai+tiktoken, google-genai, boto3,
 # anthropic[vertex,bedrock] … all of them in one resolution, which is what
 # forces the version reconciliation below.
 [tool.poetry.dependencies]
@@ -63,7 +63,6 @@ jmespath = "1.1.0"
 aws-bedrock-token-generator = "^1.1.0"
 
 # vertexai adapter only
-google-cloud-aiplatform = "1.138.0"
 google-auth = "2.49.0"
 google-genai = "1.72.0"
 pypdf = { version = "6.21.4", extras = ["crypto"] }
