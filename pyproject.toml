@@ -45,7 +45,7 @@ httpx = "0.28.1"
 aiohttp = "3.14.4"
 pillow = "13.0.0"
 anthropic = { version = "0.105.0", extras = ["vertex", "bedrock", "aiohttp"] }
-aidial-adapter-anthropic = { version = "0.21.0", extras = ["bedrock"] }
+aidial-adapter-anthropic = { version = "0.22.0", extras = ["bedrock"] }
 
 # Divergences the all-four sync never covered: each is declared by only two or
 # three adapters, so it was never in the intersection. Resolved to the maximum.
@@ -65,7 +65,7 @@ aws-bedrock-token-generator = "^1.1.0"
 # vertexai adapter only
 google-auth = "2.49.0"
 google-genai = "1.72.0"
-pypdf = { version = "7.0.0", extras = ["crypto"] }
+pypdf = { version = "7.0.1", extras = ["crypto"] }
 mistralai = { version = "2.9.4", extras = ["gcp"] }
 
 [tool.poetry.group.test.dependencies]
